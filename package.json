@@ -1,0 +1,16 @@
+{
+  "name": "auto-cae",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Auto CAE — STEP viewer + boundary conditions + CalculiX static analysis",
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "dev:api": "python -m uvicorn app.main:app --reload --app-dir apps/api --host 127.0.0.1 --port 8000",
+    "build:web": "pnpm --filter web build",
+    "doctor": "python scripts/doctor.py"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
