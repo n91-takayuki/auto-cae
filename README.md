@@ -53,8 +53,10 @@ STEP ファイルを読み込んで面クリックで境界条件を設定する
 
 CalculiX はソルバ本体。Windows バイナリは手動配置が必要です。
 
-1. <http://www.dhondt.de/> または <https://bconverged.com/> から **ccx の Windows 版** (zip) を入手
-   - bConverged のフリービルドがお手軽 (MKL 同梱)
+1. ~~<http://www.dhondt.de/> または <https://bconverged.com/> から **ccx の Windows 版** (zip) を入手
+   - bConverged のフリービルドがお手軽 (MKL 同梱)~~
+   PrePoMaxの公式サイト（prepomax.fs.um.si）から、最新版のzipファイルをダウンロードします。
+   zipファイルの中に Solver というフォルダがあり、そこにCalculiXの実行ファイルccx.exeとDLLが入っています。
 2. zip を展開して `C:\cae\ccx\` に配置。以下の構成を想定:
    ```
    C:\cae\ccx\
