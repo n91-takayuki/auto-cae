@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal, Union
+from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -11,12 +11,34 @@ class FixBC(BaseModel):
     dofs: dict[str, bool]  # {x,y,z}
 
 
+class LoadApplicationFace(BaseModel):
+    mode: Literal["face"] = "face"
+
+
+class LoadApplicationPoint(BaseModel):
+    mode: Literal["point"] = "point"
+    point: list[float]  # [x, y, z] in mm (model space)
+
+
+class LoadApplicationRegion(BaseModel):
+    mode: Literal["region"] = "region"
+    point: list[float]   # [x, y, z] in mm
+    radius: float        # mm
+
+
+LoadApplication = Annotated[
+    Union[LoadApplicationFace, LoadApplicationPoint, LoadApplicationRegion],
+    Field(discriminator="mode"),
+]
+
+
 class LoadBC(BaseModel):
     type: Literal["load"] = "load"
     faceIds: list[int]
     magnitude: float
     kind: Literal["force", "pressure"]
     direction: Union[Literal["normal"], dict[str, float]]
+    application: LoadApplication = Field(default_factory=LoadApplicationFace)
 
 
 BC = Union[FixBC, LoadBC]

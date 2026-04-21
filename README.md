@@ -11,10 +11,16 @@ STEP ファイルを読み込んで面クリックで境界条件を設定する
 # 2. 依存診断
 python scripts\doctor.py
 
-# 3. 開発サーバ起動 (別ターミナル2つ)
-conda activate cae
-pnpm dev:api      # http://127.0.0.1:8000
-pnpm dev:web      # http://127.0.0.1:5173
+# 3. 開発サーバ起動 (ワンコマンド)
+start.bat        # ダブルクリックでも可。API+Web を別ウィンドウで起動し、ブラウザも開く
+```
+
+もしくは手動 (ターミナル2つ):
+
+```powershell
+.\.venv\Scripts\activate
+pnpm dev:api     # http://127.0.0.1:8000
+pnpm dev:web     # http://127.0.0.1:5173
 ```
 
 ## 構成

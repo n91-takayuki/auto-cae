@@ -1,6 +1,15 @@
-import { useState } from "react";
-import { Anchor, ArrowDownToLine, SlidersHorizontal, MousePointerClick } from "lucide-react";
+import { useEffect, useState } from "react";
+import {
+  Anchor,
+  ArrowDownToLine,
+  Crosshair,
+  SlidersHorizontal,
+  MousePointerClick,
+  Target,
+  Square,
+} from "lucide-react";
 import { useProject } from "@/store/useProject";
+import type { LoadApplication } from "@/api/client";
 import { MATERIALS, type MaterialSpec } from "@/data/materials";
 
 export function RightProps() {
@@ -49,7 +58,13 @@ export function RightProps() {
 function BCCreator() {
   const addFix = useProject((s) => s.addFix);
   const addLoad = useProject((s) => s.addLoad);
+  const clearPlacement = useProject((s) => s.clearPlacement);
   const [mode, setMode] = useState<"fix" | "load" | null>(null);
+
+  // When switching away from load creation, clear any placement state
+  useEffect(() => {
+    if (mode !== "load") clearPlacement();
+  }, [mode, clearPlacement]);
 
   return (
     <div className="space-y-2">
@@ -103,6 +118,7 @@ function LoadForm({
     magnitude: number;
     kind: "force" | "pressure";
     direction: "normal" | { x: number; y: number; z: number };
+    application: LoadApplication;
   }) => void;
 }) {
   const [kind, setKind] = useState<"force" | "pressure">("force");
@@ -111,16 +127,68 @@ function LoadForm({
   const [dx, setDx] = useState("0");
   const [dy, setDy] = useState("0");
   const [dz, setDz] = useState("-1");
+  const [appMode, setAppMode] = useState<"face" | "point" | "region">("face");
+
+  const project = useProject((s) => s.project);
+  const placementMode = useProject((s) => s.placementMode);
+  const placementPoint = useProject((s) => s.placementPoint);
+  const placementRadius = useProject((s) => s.placementRadius);
+  const setPlacementMode = useProject((s) => s.setPlacementMode);
+  const setPlacementPoint = useProject((s) => s.setPlacementPoint);
+  const setPlacementRadius = useProject((s) => s.setPlacementRadius);
+
+  // Seed a reasonable default radius (~2% of bbox diagonal) once a project loads
+  useEffect(() => {
+    if (!project) return;
+    const sx = project.bboxMax[0] - project.bboxMin[0];
+    const sy = project.bboxMax[1] - project.bboxMin[1];
+    const sz = project.bboxMax[2] - project.bboxMin[2];
+    const diag = Math.hypot(sx, sy, sz);
+    const r = Math.max(diag * 0.02, 0.1);
+    // Only seed if still at the default 1.0
+    if (placementRadius === 1.0) setPlacementRadius(Number(r.toFixed(3)));
+    // Intentionally not re-running on placementRadius change
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.id]);
+
+  // Sync UI mode with placementMode in the store
+  useEffect(() => {
+    if (appMode === "face") {
+      setPlacementMode(null);
+      setPlacementPoint(null);
+    } else {
+      setPlacementMode(appMode);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appMode]);
 
   const submit = () => {
     const m = Number(magnitude);
     if (!Number.isFinite(m) || m === 0) return;
+    if (appMode !== "face" && !placementPoint) return;
     const direction =
       dirMode === "normal"
-        ? "normal"
+        ? ("normal" as const)
         : { x: Number(dx) || 0, y: Number(dy) || 0, z: Number(dz) || 0 };
-    onSubmit({ magnitude: m, kind, direction });
+
+    let application: LoadApplication;
+    if (appMode === "face") {
+      application = { mode: "face" };
+    } else if (appMode === "point") {
+      application = { mode: "point", point: placementPoint! };
+    } else {
+      application = {
+        mode: "region",
+        point: placementPoint!,
+        radius: placementRadius,
+      };
+    }
+    onSubmit({ magnitude: m, kind, direction, application });
   };
+
+  const pointStr = placementPoint
+    ? `${placementPoint[0].toFixed(2)}, ${placementPoint[1].toFixed(2)}, ${placementPoint[2].toFixed(2)}`
+    : null;
 
   return (
     <div className="space-y-2 rounded-xl border border-stroke/60 bg-white/[0.02] p-3">
@@ -128,11 +196,67 @@ function LoadForm({
         <ToggleChip active={kind === "force"} onClick={() => setKind("force")}>
           合力 [N]
         </ToggleChip>
-        <ToggleChip active={kind === "pressure"} onClick={() => setKind("pressure")}>
+        <ToggleChip
+          active={kind === "pressure"}
+          onClick={() => setKind("pressure")}
+          disabled={appMode === "point"}
+          title={appMode === "point" ? "点荷重では圧力は使えません" : undefined}
+        >
           圧力 [MPa]
         </ToggleChip>
       </div>
       <NumInput label="大きさ" value={magnitude} onChange={setMagnitude} />
+
+      <div className="text-[11px] uppercase tracking-wider text-slate-400 pt-1">適用範囲</div>
+      <div className="flex gap-1">
+        <ToggleChip active={appMode === "face"} onClick={() => setAppMode("face")}>
+          <span className="inline-flex items-center gap-1">
+            <Square className="h-3 w-3" /> 面全体
+          </span>
+        </ToggleChip>
+        <ToggleChip
+          active={appMode === "point"}
+          onClick={() => {
+            setAppMode("point");
+            if (kind === "pressure") setKind("force");
+          }}
+        >
+          <span className="inline-flex items-center gap-1">
+            <Crosshair className="h-3 w-3" /> 点
+          </span>
+        </ToggleChip>
+        <ToggleChip active={appMode === "region"} onClick={() => setAppMode("region")}>
+          <span className="inline-flex items-center gap-1">
+            <Target className="h-3 w-3" /> 範囲
+          </span>
+        </ToggleChip>
+      </div>
+
+      {appMode !== "face" && (
+        <div className="space-y-1.5 rounded-lg border border-stroke/60 bg-white/[0.02] p-2">
+          <button
+            className={`btn w-full ${placementMode ? "ring-1 ring-cyan-400/60" : ""}`}
+            onClick={() => {
+              // Toggle placement-mode: re-enable picking even if a point was set
+              setPlacementMode(placementMode ? null : appMode);
+            }}
+          >
+            <Crosshair className="h-4 w-4 text-cyan-300" />
+            {placementMode ? "3Dビューでクリック…" : placementPoint ? "再配置" : "位置を指定"}
+          </button>
+          <div className="font-mono text-[11px] text-slate-400">
+            位置: {pointStr ?? <span className="text-slate-600">未指定</span>}
+          </div>
+          {appMode === "region" && (
+            <RadiusInput
+              value={placementRadius}
+              onChange={setPlacementRadius}
+              project={project}
+            />
+          )}
+        </div>
+      )}
+
       <div className="text-[11px] uppercase tracking-wider text-slate-400 pt-1">方向</div>
       <div className="flex gap-1">
         <ToggleChip active={dirMode === "normal"} onClick={() => setDirMode("normal")}>
@@ -149,9 +273,49 @@ function LoadForm({
           <NumInput label="Z" value={dz} onChange={setDz} compact />
         </div>
       )}
-      <button className="btn-accent w-full" onClick={submit}>
+      <button
+        className="btn-accent w-full"
+        onClick={submit}
+        disabled={appMode !== "face" && !placementPoint}
+      >
         追加
       </button>
+    </div>
+  );
+}
+
+function RadiusInput({
+  value,
+  onChange,
+  project,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  project: { bboxMin: [number, number, number]; bboxMax: [number, number, number] } | null;
+}) {
+  let maxR = 100;
+  if (project) {
+    const sx = project.bboxMax[0] - project.bboxMin[0];
+    const sy = project.bboxMax[1] - project.bboxMin[1];
+    const sz = project.bboxMax[2] - project.bboxMin[2];
+    maxR = Math.max(Math.hypot(sx, sy, sz) * 0.5, 1);
+  }
+  const step = maxR / 200;
+  return (
+    <div>
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] text-slate-400">半径</span>
+        <span className="font-mono text-[11px] text-slate-200">{value.toFixed(3)} mm</span>
+      </div>
+      <input
+        type="range"
+        min={step}
+        max={maxR}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="mt-1 w-full accent-cyan-400"
+      />
     </div>
   );
 }
@@ -183,16 +347,24 @@ function ToggleChip({
   active,
   onClick,
   children,
+  disabled = false,
+  title,
 }: {
   active: boolean;
   onClick: () => void;
   children: React.ReactNode;
+  disabled?: boolean;
+  title?: string;
 }) {
   return (
     <button
       onClick={onClick}
+      disabled={disabled}
+      title={title}
       className={`flex-1 rounded-lg border px-2 py-1 text-xs transition ${
-        active
+        disabled
+          ? "cursor-not-allowed border-stroke/40 bg-white/[0.02] text-slate-600"
+          : active
           ? "border-cyan-400/60 bg-cyan-400/10 text-cyan-200"
           : "border-stroke bg-white/[0.03] text-slate-400"
       }`}

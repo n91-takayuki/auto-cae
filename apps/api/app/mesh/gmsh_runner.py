@@ -13,7 +13,15 @@ from typing import Callable, Iterable
 import numpy as np
 
 from ..cad.step_loader import GeometryPayload
-from ..schemas.jobs import BC, FixBC, LoadBC, Material, MeshOptions
+from ..schemas.jobs import (
+    BC,
+    FixBC,
+    LoadApplicationPoint,
+    LoadApplicationRegion,
+    LoadBC,
+    Material,
+    MeshOptions,
+)
 
 ProgressFn = Callable[[float, str], None]
 
@@ -255,8 +263,8 @@ def _collect_bc_payloads(
         area = 0.0
         normal = np.zeros(3, dtype=np.float64)
         if isinstance(bc, LoadBC):
-            # Iterate all 2D elements belonging to this BC's surfaces
-            # Physical group -> entity tags:
+            # Gather this BC's surface triangles as (ia, ib, ic) compact indices
+            tris: list[tuple[int, int, int]] = []
             entities = gmsh.model.getEntitiesForPhysicalGroup(2, phys)
             for ent in entities:
                 stypes, _st_tags, sconn = gmsh.model.mesh.getElements(dim=2, tag=int(ent))
@@ -265,21 +273,88 @@ def _collect_bc_payloads(
                         ncol = 3 if stype == 2 else 6
                         arr = np.asarray(sc, dtype=np.int64).reshape(-1, ncol)
                         for row in arr:
-                            ia = tag_to_idx[int(row[0])]
-                            ib = tag_to_idx[int(row[1])]
-                            ic = tag_to_idx[int(row[2])]
-                            pa, pb, pc = coords[ia], coords[ib], coords[ic]
-                            cross = np.cross(pb - pa, pc - pa)
-                            a = 0.5 * float(np.linalg.norm(cross))
-                            area += a
-                            if a > 0:
-                                normal += 0.5 * cross  # area-weighted
+                            tris.append(
+                                (
+                                    tag_to_idx[int(row[0])],
+                                    tag_to_idx[int(row[1])],
+                                    tag_to_idx[int(row[2])],
+                                )
+                            )
+
+            # Area-weighted face normal (from *all* tris on this face)
+            for ia, ib, ic in tris:
+                cross = np.cross(coords[ib] - coords[ia], coords[ic] - coords[ia])
+                a = 0.5 * float(np.linalg.norm(cross))
+                if a > 0:
+                    normal += 0.5 * cross
             n_len = float(np.linalg.norm(normal))
             if n_len > 1e-18:
                 normal /= n_len
 
+            # Apply application-mode filter on node_tags + recompute effective area
+            node_tags, area = _filter_load_nodes(
+                bc, node_tags, coords, tag_to_idx, tris
+            )
+
         out.append(BCPayload(idx=i, bc=bc, node_tags=node_tags, area=area, normal=normal))
     return out
+
+
+def _filter_load_nodes(
+    bc: LoadBC,
+    node_tags: np.ndarray,
+    coords: np.ndarray,
+    tag_to_idx: dict[int, int],
+    tris: list[tuple[int, int, int]],
+) -> tuple[np.ndarray, float]:
+    """Restrict load nodes to the application mode and compute effective area.
+
+    - face: all nodes, area = sum of all tris
+    - point: single closest node on this face, area = 0 (pressure → 0 force)
+    - region: nodes within radius, area = sum of tris whose all 3 verts are in region
+    """
+    app = bc.application
+
+    if isinstance(app, LoadApplicationPoint):
+        target = np.asarray(app.point, dtype=np.float64)
+        # indices into coords for all nodes on this face
+        idxs = np.fromiter(
+            (tag_to_idx[int(t)] for t in node_tags.tolist()), dtype=np.int64
+        )
+        if idxs.size == 0:
+            return node_tags, 0.0
+        pts = coords[idxs]
+        d2 = np.sum((pts - target) ** 2, axis=1)
+        best = int(np.argmin(d2))
+        return np.asarray([int(node_tags[best])], dtype=np.int64), 0.0
+
+    if isinstance(app, LoadApplicationRegion):
+        target = np.asarray(app.point, dtype=np.float64)
+        r2 = float(app.radius) ** 2
+        # Filter nodes
+        keep: list[int] = []
+        keep_idx_set: set[int] = set()
+        for t in node_tags.tolist():
+            ci = tag_to_idx[int(t)]
+            if float(np.sum((coords[ci] - target) ** 2)) <= r2:
+                keep.append(int(t))
+                keep_idx_set.add(ci)
+        if not keep:
+            return np.zeros(0, dtype=np.int64), 0.0
+        # Effective area: tris with all three corner nodes in region
+        area = 0.0
+        for ia, ib, ic in tris:
+            if ia in keep_idx_set and ib in keep_idx_set and ic in keep_idx_set:
+                cross = np.cross(coords[ib] - coords[ia], coords[ic] - coords[ia])
+                area += 0.5 * float(np.linalg.norm(cross))
+        return np.asarray(keep, dtype=np.int64), area
+
+    # face (default)
+    area = 0.0
+    for ia, ib, ic in tris:
+        cross = np.cross(coords[ib] - coords[ia], coords[ic] - coords[ia])
+        area += 0.5 * float(np.linalg.norm(cross))
+    return node_tags, area
 
 
 # --------------------------------------------------------------------- writer

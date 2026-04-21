@@ -3,6 +3,7 @@ import type {
   BCInput,
   GeometryDTO,
   JobDTO,
+  LoadApplication,
   ProjectDTO,
   ResultDTO,
 } from "@/api/client";
@@ -25,7 +26,10 @@ export type LoadBC = {
   magnitude: number;
   kind: "force" | "pressure";
   direction: "normal" | { x: number; y: number; z: number };
+  application: LoadApplication;
 };
+
+export type PlacementMode = "point" | "region" | null;
 
 export type BC = FixBC | LoadBC;
 
@@ -51,6 +55,15 @@ type State = {
   meshSizeFactor: number;
   showMeshEdges: boolean;
 
+  placementMode: PlacementMode;
+  placementPoint: [number, number, number] | null;
+  placementRadius: number;
+
+  setPlacementMode: (m: PlacementMode) => void;
+  setPlacementPoint: (p: [number, number, number] | null) => void;
+  setPlacementRadius: (r: number) => void;
+  clearPlacement: () => void;
+
   setDispScale: (v: number) => void;
   setShowResult: (v: boolean) => void;
   setMaterial: (m: MaterialSpec) => void;
@@ -67,7 +80,9 @@ type State = {
   clearSelection: () => void;
 
   addFix: (dofs?: { x: boolean; y: boolean; z: boolean }) => void;
-  addLoad: (input: Omit<LoadBC, "id" | "type" | "faceIds">) => void;
+  addLoad: (input: Omit<LoadBC, "id" | "type" | "faceIds" | "application"> & {
+    application?: LoadApplication;
+  }) => void;
   removeBc: (id: string) => void;
 
   runAnalysis: () => Promise<void>;
@@ -94,6 +109,16 @@ export const useProject = create<State>((set, get) => ({
   history: [],
   meshSizeFactor: 1.0,
   showMeshEdges: false,
+
+  placementMode: null,
+  placementPoint: null,
+  placementRadius: 1.0,
+
+  setPlacementMode: (m) => set({ placementMode: m }),
+  setPlacementPoint: (p) => set({ placementPoint: p }),
+  setPlacementRadius: (r) => set({ placementRadius: r }),
+  clearPlacement: () =>
+    set({ placementMode: null, placementPoint: null }),
 
   setDispScale: (v) => set({ dispScale: v }),
   setShowResult: (v) => set({ showResult: v }),
@@ -141,6 +166,8 @@ export const useProject = create<State>((set, get) => ({
         result: null,
         showResult: true,
         dispScale: 1,
+        placementMode: null,
+        placementPoint: null,
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -161,6 +188,8 @@ export const useProject = create<State>((set, get) => ({
       result: null,
       showResult: true,
       dispScale: 1,
+      placementMode: null,
+      placementPoint: null,
     }),
 
   setHovered: (id) => set({ hoveredFaceId: id }),
@@ -183,14 +212,34 @@ export const useProject = create<State>((set, get) => ({
     get().log("info", `拘束追加: ${ids.length} 面 (${dofName(dofs)})`);
   },
 
-  addLoad: ({ magnitude, kind, direction }) => {
+  addLoad: ({ magnitude, kind, direction, application }) => {
     const ids = Array.from(get().selectedFaceIds);
     if (ids.length === 0) return;
-    const bc: LoadBC = { id: mkId(), type: "load", faceIds: ids, magnitude, kind, direction };
-    set((s) => ({ bcs: [...s.bcs, bc], selectedFaceIds: new Set() }));
+    const app: LoadApplication = application ?? { mode: "face" };
+    const bc: LoadBC = {
+      id: mkId(),
+      type: "load",
+      faceIds: ids,
+      magnitude,
+      kind,
+      direction,
+      application: app,
+    };
+    set((s) => ({
+      bcs: [...s.bcs, bc],
+      selectedFaceIds: new Set(),
+      placementMode: null,
+      placementPoint: null,
+    }));
+    const appLabel =
+      app.mode === "face"
+        ? "面全体"
+        : app.mode === "point"
+          ? "点"
+          : `範囲 r=${app.radius.toFixed(2)}mm`;
     get().log(
       "info",
-      `荷重追加: ${ids.length} 面 · ${magnitude} ${kind === "force" ? "N" : "MPa"}`
+      `荷重追加: ${ids.length} 面 · ${appLabel} · ${magnitude} ${kind === "force" ? "N" : "MPa"}`
     );
   },
 
@@ -217,6 +266,7 @@ export const useProject = create<State>((set, get) => ({
             magnitude: b.magnitude,
             kind: b.kind,
             direction: b.direction,
+            application: b.application,
           }
     );
 

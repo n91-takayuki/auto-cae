@@ -27,12 +27,18 @@ export type FixBCInput = {
   dofs: { x: boolean; y: boolean; z: boolean };
 };
 
+export type LoadApplication =
+  | { mode: "face" }
+  | { mode: "point"; point: [number, number, number] }
+  | { mode: "region"; point: [number, number, number]; radius: number };
+
 export type LoadBCInput = {
   type: "load";
   faceIds: number[];
   magnitude: number;
   kind: "force" | "pressure";
   direction: "normal" | { x: number; y: number; z: number };
+  application: LoadApplication;
 };
 
 export type BCInput = FixBCInput | LoadBCInput;
