@@ -13,15 +13,7 @@ from typing import Callable, Iterable
 import numpy as np
 
 from ..cad.step_loader import GeometryPayload
-from ..schemas.jobs import (
-    BC,
-    FixBC,
-    LoadApplicationPoint,
-    LoadApplicationRegion,
-    LoadBC,
-    Material,
-    MeshOptions,
-)
+from ..schemas.jobs import BC, FixBC, LoadBC, Material, MeshOptions
 
 ProgressFn = Callable[[float, str], None]
 
@@ -33,13 +25,34 @@ class MeshResult:
     inp_path: Path
     node_count: int
     element_count: int
-    # per-node (1-based node tags compacted to 0-based array index)
     node_tags: np.ndarray       # int64, shape (N,)
     node_coords: np.ndarray     # float64, shape (N, 3)   in mm
-    # tet10 connectivity, compacted node indices (0-based into node_coords)
     tet_conn: np.ndarray        # int64, shape (E, 10)
-    # surface tri mesh for post-processing overlay (outer surface, linear triangles)
-    surface_tris: np.ndarray    # int64, shape (T, 3)  (0-based into node_coords)
+    surface_tris: np.ndarray    # int64, shape (T, 3)
+    strategy_used: str = ""
+
+
+# Meshing strategies tried in order. Each has progressively more aggressive
+# healing / more robust algorithms. We do not change the user-requested mesh
+# size in any of them (size is the user's responsibility).
+@dataclass(frozen=True)
+class _Strategy:
+    name: str
+    heal: bool          # apply OCC heal + remove duplicates after import
+    algo2d: int         # Mesh.Algorithm   (1=MeshAdapt, 2=Auto, 5=Delaunay, 6=Frontal-Delaunay)
+    algo3d: int         # Mesh.Algorithm3D (1=Delaunay, 4=Frontal, 7=MMG3D, 9=R-tree, 10=HXT)
+    order_at_gen: int   # 2: gen tet10 directly. 1: gen tet4, then setOrder(2)
+    extra: dict[str, float] = None  # type: ignore[assignment]
+
+
+_STRATEGIES: list[_Strategy] = [
+    _Strategy("default (FrontalDelaunay+Delaunay)",       False, 6, 1, 2),
+    _Strategy("HXT 3D",                                   False, 6, 10, 2),
+    _Strategy("heal + HXT",                                True, 6, 10, 2),
+    _Strategy("heal + HXT + linear-then-elevate",          True, 6, 10, 1),
+    _Strategy("heal + Delaunay2D + Delaunay3D + linear",   True, 5, 1, 1),
+    _Strategy("heal + MeshAdapt + Frontal3D + linear",     True, 1, 4, 1),
+]
 
 
 def mesh_and_write_inp(
@@ -53,8 +66,9 @@ def mesh_and_write_inp(
 ) -> MeshResult:
     """Load STEP via gmsh, mesh to tet10, and write a CalculiX .inp with BCs.
 
-    face_id in ``bcs`` refers to the OCP face enumeration index. We map those to
-    gmsh surface tags via centroid nearest-neighbour.
+    Tries multiple strategies in order; the first that produces a valid tet10
+    mesh wins. Mesh size is taken verbatim from ``options.sizeFactor`` and is
+    NOT altered between strategies.
     """
     import gmsh
 
@@ -62,73 +76,92 @@ def mesh_and_write_inp(
         if progress:
             progress(v, msg)
 
+    # Characteristic size from bbox diagonal (deterministic from user input)
+    xmin, ymin, zmin = geometry.bbox_min
+    xmax, ymax, zmax = geometry.bbox_max
+    diag = float(((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2) ** 0.5)
+    target = max(diag / 20.0 * options.sizeFactor, 1e-3)
+
     with _GMSH_LOCK:
-        # gmsh must be initialized once in the main thread (done at app startup).
-        # Here we only reset per-job state.
-        try:
-            gmsh.clear()
-        except Exception:
-            pass
-        try:
-            gmsh.option.setNumber("General.Terminal", 0)
-            p(0.05, "gmsh: importing STEP")
-            gmsh.model.add("job")
-            gmsh.model.occ.importShapes(str(step_path))
-            gmsh.model.occ.synchronize()
+        last_err: Exception | None = None
+        for i, strat in enumerate(_STRATEGIES):
+            stage_lo = 0.05 + 0.55 * (i / len(_STRATEGIES))
+            stage_hi = 0.05 + 0.55 * ((i + 1) / len(_STRATEGIES))
+            p(stage_lo, f"gmsh: try [{strat.name}]")
+            try:
+                _setup_strategy(gmsh, strat, target, diag)
+                p(stage_lo + (stage_hi - stage_lo) * 0.1, "gmsh: importing STEP")
+                gmsh.model.add("job")
+                gmsh.model.occ.importShapes(str(step_path))
+                if strat.heal:
+                    p(stage_lo + (stage_hi - stage_lo) * 0.25, "gmsh: healing geometry")
+                    try:
+                        gmsh.model.occ.healShapes()
+                    except Exception:
+                        pass
+                    try:
+                        gmsh.model.occ.removeAllDuplicates()
+                    except Exception:
+                        pass
+                gmsh.model.occ.synchronize()
 
-            # Characteristic size from bbox diagonal
-            xmin, ymin, zmin = geometry.bbox_min
-            xmax, ymax, zmax = geometry.bbox_max
-            diag = float(
-                ((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2) ** 0.5
+                face_id_to_tag = _map_faces_to_gmsh(gmsh, geometry)
+                bc_tags = _assign_bc_physical_groups(gmsh, bcs, face_id_to_tag)
+
+                p(stage_lo + (stage_hi - stage_lo) * 0.4, "gmsh: meshing")
+                gmsh.model.mesh.generate(3)
+                if strat.order_at_gen == 1:
+                    p(stage_lo + (stage_hi - stage_lo) * 0.8, "gmsh: elevating to order 2")
+                    gmsh.model.mesh.setOrder(2)
+
+                if not _has_tet10(gmsh):
+                    raise RuntimeError("no tet10 elements produced")
+
+                # Success — break out of strategy loop
+                used = strat
+                break
+
+            except Exception as e:
+                last_err = e
+                # Reset and try next strategy
+                try:
+                    gmsh.clear()
+                except Exception:
+                    pass
+                continue
+        else:
+            # All strategies failed
+            raise RuntimeError(
+                f"All {len(_STRATEGIES)} meshing strategies failed. "
+                f"Last error: {last_err}. "
+                f"Common causes: invalid STEP topology, sliver faces, "
+                f"or extreme aspect ratios. Try cleaning the CAD model."
             )
-            target = max(diag / 20.0 * options.sizeFactor, 1e-3)
-            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", target * 0.25)
-            gmsh.option.setNumber("Mesh.CharacteristicLengthMax", target)
-            gmsh.option.setNumber("Mesh.ElementOrder", 2)
-            gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
-            gmsh.option.setNumber("Mesh.Algorithm", 6)     # Frontal-Delaunay
-            gmsh.option.setNumber("Mesh.Algorithm3D", 1)   # Delaunay
 
-            # Face mapping: OCP face_id -> gmsh surface tag via centroid match
-            face_id_to_tag = _map_faces_to_gmsh(gmsh, geometry)
-
-            # Assign physical groups per BC
-            bc_tags = _assign_bc_physical_groups(gmsh, bcs, face_id_to_tag)
-
-            p(0.15, "gmsh: meshing (tet10)")
-            gmsh.model.mesh.generate(3)
-            gmsh.model.mesh.setOrder(2)
-
-            # Extract mesh
-            p(0.45, "gmsh: extracting mesh")
+        try:
+            p(0.65, "gmsh: extracting mesh")
             node_tags_raw, coords_flat, _ = gmsh.model.mesh.getNodes()
             node_tags = np.asarray(node_tags_raw, dtype=np.int64)
             coords = np.asarray(coords_flat, dtype=np.float64).reshape(-1, 3)
-
-            # Build compact index map: original tag -> 0-based index
             tag_to_idx = {int(t): i for i, t in enumerate(node_tags)}
 
-            # Volume elements (tet10 = type 11)
-            et_types, et_tags, et_conn = gmsh.model.mesh.getElements(dim=3)
+            et_types, _et_tags, et_conn = gmsh.model.mesh.getElements(dim=3)
             tet_conn_idx: list[list[int]] = []
-            for tcode, _tags, conn in zip(et_types, et_tags, et_conn):
+            for tcode, conn in zip(et_types, et_conn):
                 if tcode != 11:
                     continue
                 arr = np.asarray(conn, dtype=np.int64).reshape(-1, 10)
                 for row in arr:
                     tet_conn_idx.append([tag_to_idx[int(x)] for x in row])
             if not tet_conn_idx:
-                raise RuntimeError("gmsh produced no tet10 elements")
+                raise RuntimeError("gmsh produced no tet10 elements after extraction")
             tet_conn_arr = np.asarray(tet_conn_idx, dtype=np.int64)
 
-            # Outer surface triangles (for post-processing overlay).
-            # Gather all 2D elements (tri6 = type 9) across all surfaces.
             surface_tris: list[list[int]] = []
-            for dim, tag in gmsh.model.getEntities(2):
+            for _dim, tag in gmsh.model.getEntities(2):
                 st_types, _st_tags, st_conn = gmsh.model.mesh.getElements(dim=2, tag=tag)
                 for stype, sconn in zip(st_types, st_conn):
-                    if stype == 9:  # tri6
+                    if stype == 9:
                         arr = np.asarray(sconn, dtype=np.int64).reshape(-1, 6)
                         for row in arr:
                             surface_tris.append([
@@ -136,7 +169,7 @@ def mesh_and_write_inp(
                                 tag_to_idx[int(row[1])],
                                 tag_to_idx[int(row[2])],
                             ])
-                    elif stype == 2:  # tri3
+                    elif stype == 2:
                         arr = np.asarray(sconn, dtype=np.int64).reshape(-1, 3)
                         for row in arr:
                             surface_tris.append([tag_to_idx[int(x)] for x in row])
@@ -146,16 +179,15 @@ def mesh_and_write_inp(
                 else np.zeros((0, 3), dtype=np.int64)
             )
 
-            # Per-BC node tag set and normal/area for load distribution
             bc_payloads = _collect_bc_payloads(gmsh, bcs, bc_tags, coords, tag_to_idx)
 
-            p(0.70, "writing .inp")
+            p(0.80, "writing .inp")
             inp_path = out_dir / "job.inp"
             _write_inp(
                 inp_path=inp_path,
                 node_tags=node_tags,
                 coords=coords,
-                tet_conn=tet_conn_arr,  # already compact indices (0-based)
+                tet_conn=tet_conn_arr,
                 tag_to_idx=tag_to_idx,
                 bc_payloads=bc_payloads,
                 material=material,
@@ -169,20 +201,66 @@ def mesh_and_write_inp(
                 node_coords=coords,
                 tet_conn=tet_conn_arr,
                 surface_tris=surface_tris_arr,
+                strategy_used=used.name,
             )
         finally:
-            # Don't finalize — we reuse the singleton.
             try:
                 gmsh.clear()
             except Exception:
                 pass
 
 
+def _setup_strategy(gmsh, strat: _Strategy, target: float, diag: float) -> None:
+    """Reset gmsh state and configure options for this strategy attempt."""
+    try:
+        gmsh.clear()
+    except Exception:
+        pass
+    gmsh.option.setNumber("General.Terminal", 0)
+
+    # Healing-related OCC import options (must be set BEFORE importShapes)
+    if strat.heal:
+        # Tolerance scaled to the geometry size
+        tol = max(diag * 1e-5, 1e-6)
+        gmsh.option.setNumber("Geometry.OCCAutoFix", 1)
+        gmsh.option.setNumber("Geometry.OCCFixDegenerated", 1)
+        gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 1)
+        gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 1)
+        gmsh.option.setNumber("Geometry.OCCSewFaces", 1)
+        gmsh.option.setNumber("Geometry.OCCMakeSolids", 1)
+        gmsh.option.setNumber("Geometry.Tolerance", tol)
+        gmsh.option.setNumber("Geometry.ToleranceBoolean", tol)
+    else:
+        gmsh.option.setNumber("Geometry.OCCAutoFix", 0)
+        gmsh.option.setNumber("Geometry.OCCFixDegenerated", 0)
+        gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 0)
+        gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 0)
+        gmsh.option.setNumber("Geometry.OCCSewFaces", 0)
+
+    # Mesh size — kept identical across strategies (per user requirement)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", target * 0.25)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", target)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+
+    # Algorithm choices for this attempt
+    gmsh.option.setNumber("Mesh.ElementOrder", strat.order_at_gen)
+    gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
+    gmsh.option.setNumber("Mesh.Algorithm", strat.algo2d)
+    gmsh.option.setNumber("Mesh.Algorithm3D", strat.algo3d)
+    # Allow some optimisation passes — improves robustness on bad input
+    gmsh.option.setNumber("Mesh.Optimize", 1)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 0)
+
+
+def _has_tet10(gmsh) -> bool:
+    et_types, _, _ = gmsh.model.mesh.getElements(dim=3)
+    return any(int(t) == 11 for t in et_types)
+
+
 # --------------------------------------------------------------------- mapping
 
 def _map_faces_to_gmsh(gmsh, geometry: GeometryPayload) -> dict[int, int]:
     """Match OCP face_id -> gmsh surface tag via centroid nearest-neighbour."""
-    # OCP centroids
     ocp_centroids: dict[int, np.ndarray] = {}
     for f in geometry.faces:
         pts = np.asarray(f.positions, dtype=np.float64).reshape(-1, 3)
@@ -190,15 +268,12 @@ def _map_faces_to_gmsh(gmsh, geometry: GeometryPayload) -> dict[int, int]:
             continue
         ocp_centroids[f.face_id] = pts.mean(axis=0)
 
-    # gmsh centroids
     gmsh_tags = [tag for _dim, tag in gmsh.model.getEntities(2)]
     gmsh_centroids: dict[int, np.ndarray] = {}
     for t in gmsh_tags:
         cx, cy, cz = gmsh.model.occ.getCenterOfMass(2, t)
         gmsh_centroids[t] = np.array([cx, cy, cz], dtype=np.float64)
 
-    # Nearest match (face count may not exactly equal — OCP might drop faces
-    # with no triangulation; here we just look up per requested face_id).
     mapping: dict[int, int] = {}
     for fid, c in ocp_centroids.items():
         best_tag = -1
@@ -216,7 +291,6 @@ def _map_faces_to_gmsh(gmsh, geometry: GeometryPayload) -> dict[int, int]:
 def _assign_bc_physical_groups(
     gmsh, bcs: list[BC], face_id_to_tag: dict[int, int]
 ) -> dict[int, int]:
-    """Create a physical group per BC (index in list). Returns bc_idx -> phys_tag."""
     out: dict[int, int] = {}
     for i, bc in enumerate(bcs):
         tags = [face_id_to_tag[fid] for fid in bc.faceIds if fid in face_id_to_tag]
@@ -225,7 +299,6 @@ def _assign_bc_physical_groups(
         phys = gmsh.model.addPhysicalGroup(2, tags)
         gmsh.model.setPhysicalName(2, phys, f"BC{i}")
         out[i] = phys
-    # one physical volume for all solids so the *.inp gets element set
     vol_tags = [t for _d, t in gmsh.model.getEntities(3)]
     if vol_tags:
         vp = gmsh.model.addPhysicalGroup(3, vol_tags)
@@ -239,9 +312,9 @@ def _assign_bc_physical_groups(
 class BCPayload:
     idx: int
     bc: BC
-    node_tags: np.ndarray        # raw gmsh tags (1-based)
-    area: float                  # mm^2 (0 if unused)
-    normal: np.ndarray           # unit vector (3,) (zeros if unused)
+    node_tags: np.ndarray
+    area: float
+    normal: np.ndarray
 
 
 def _collect_bc_payloads(
@@ -259,12 +332,9 @@ def _collect_bc_payloads(
         node_tags_raw, _c = gmsh.model.mesh.getNodesForPhysicalGroup(2, phys)
         node_tags = np.asarray(node_tags_raw, dtype=np.int64)
 
-        # For loads, compute surface area + area-weighted normal from tri6/tri3
         area = 0.0
         normal = np.zeros(3, dtype=np.float64)
         if isinstance(bc, LoadBC):
-            # Gather this BC's surface triangles as (ia, ib, ic) compact indices
-            tris: list[tuple[int, int, int]] = []
             entities = gmsh.model.getEntitiesForPhysicalGroup(2, phys)
             for ent in entities:
                 stypes, _st_tags, sconn = gmsh.model.mesh.getElements(dim=2, tag=int(ent))
@@ -273,92 +343,24 @@ def _collect_bc_payloads(
                         ncol = 3 if stype == 2 else 6
                         arr = np.asarray(sc, dtype=np.int64).reshape(-1, ncol)
                         for row in arr:
-                            tris.append(
-                                (
-                                    tag_to_idx[int(row[0])],
-                                    tag_to_idx[int(row[1])],
-                                    tag_to_idx[int(row[2])],
-                                )
-                            )
-
-            # Area-weighted face normal (from *all* tris on this face)
-            for ia, ib, ic in tris:
-                cross = np.cross(coords[ib] - coords[ia], coords[ic] - coords[ia])
-                a = 0.5 * float(np.linalg.norm(cross))
-                if a > 0:
-                    normal += 0.5 * cross
+                            ia = tag_to_idx[int(row[0])]
+                            ib = tag_to_idx[int(row[1])]
+                            ic = tag_to_idx[int(row[2])]
+                            pa, pb, pc = coords[ia], coords[ib], coords[ic]
+                            cross = np.cross(pb - pa, pc - pa)
+                            a = 0.5 * float(np.linalg.norm(cross))
+                            area += a
+                            if a > 0:
+                                normal += 0.5 * cross
             n_len = float(np.linalg.norm(normal))
             if n_len > 1e-18:
                 normal /= n_len
-
-            # Apply application-mode filter on node_tags + recompute effective area
-            node_tags, area = _filter_load_nodes(
-                bc, node_tags, coords, tag_to_idx, tris
-            )
 
         out.append(BCPayload(idx=i, bc=bc, node_tags=node_tags, area=area, normal=normal))
     return out
 
 
-def _filter_load_nodes(
-    bc: LoadBC,
-    node_tags: np.ndarray,
-    coords: np.ndarray,
-    tag_to_idx: dict[int, int],
-    tris: list[tuple[int, int, int]],
-) -> tuple[np.ndarray, float]:
-    """Restrict load nodes to the application mode and compute effective area.
-
-    - face: all nodes, area = sum of all tris
-    - point: single closest node on this face, area = 0 (pressure → 0 force)
-    - region: nodes within radius, area = sum of tris whose all 3 verts are in region
-    """
-    app = bc.application
-
-    if isinstance(app, LoadApplicationPoint):
-        target = np.asarray(app.point, dtype=np.float64)
-        # indices into coords for all nodes on this face
-        idxs = np.fromiter(
-            (tag_to_idx[int(t)] for t in node_tags.tolist()), dtype=np.int64
-        )
-        if idxs.size == 0:
-            return node_tags, 0.0
-        pts = coords[idxs]
-        d2 = np.sum((pts - target) ** 2, axis=1)
-        best = int(np.argmin(d2))
-        return np.asarray([int(node_tags[best])], dtype=np.int64), 0.0
-
-    if isinstance(app, LoadApplicationRegion):
-        target = np.asarray(app.point, dtype=np.float64)
-        r2 = float(app.radius) ** 2
-        # Filter nodes
-        keep: list[int] = []
-        keep_idx_set: set[int] = set()
-        for t in node_tags.tolist():
-            ci = tag_to_idx[int(t)]
-            if float(np.sum((coords[ci] - target) ** 2)) <= r2:
-                keep.append(int(t))
-                keep_idx_set.add(ci)
-        if not keep:
-            return np.zeros(0, dtype=np.int64), 0.0
-        # Effective area: tris with all three corner nodes in region
-        area = 0.0
-        for ia, ib, ic in tris:
-            if ia in keep_idx_set and ib in keep_idx_set and ic in keep_idx_set:
-                cross = np.cross(coords[ib] - coords[ia], coords[ic] - coords[ia])
-                area += 0.5 * float(np.linalg.norm(cross))
-        return np.asarray(keep, dtype=np.int64), area
-
-    # face (default)
-    area = 0.0
-    for ia, ib, ic in tris:
-        cross = np.cross(coords[ib] - coords[ia], coords[ic] - coords[ia])
-        area += 0.5 * float(np.linalg.norm(cross))
-    return node_tags, area
-
-
 # --------------------------------------------------------------------- writer
-
 
 def _write_inp(
     *,
@@ -370,14 +372,6 @@ def _write_inp(
     bc_payloads: list[BCPayload],
     material: Material,
 ) -> None:
-    """Write a CalculiX-compatible Abaqus .inp.
-
-    - Nodes are labelled with their original gmsh tag so set membership is stable.
-    - A single element set SOLID is used with material MAT1.
-    - Fix BCs emit *BOUNDARY on node sets per active DOF.
-    - Load BCs are lumped to equal-split *CLOAD (force) or area-weighted
-      normal CLOAD (pressure). This is an MVP simplification.
-    """
     lines: list[str] = []
     lines.append("*HEADING")
     lines.append("auto_cae job")
@@ -398,12 +392,10 @@ def _write_inp(
         labels = [str(int(node_tags[idx])) for idx in reordered]
         lines.append(", ".join([str(e)] + labels))
 
-    # Node sets per BC
     for bp in bc_payloads:
         lines.append(f"*NSET, NSET=BC{bp.idx}")
         _emit_list(lines, [int(x) for x in bp.node_tags.tolist()])
 
-    # Material
     lines.append("*MATERIAL, NAME=MAT1")
     lines.append("*ELASTIC")
     lines.append(f"{material.young:.6g}, {material.poisson:.4g}")
@@ -411,11 +403,9 @@ def _write_inp(
     lines.append(f"{material.density:.6g}")
     lines.append("*SOLID SECTION, ELSET=SOLID, MATERIAL=MAT1")
 
-    # Step
     lines.append("*STEP")
     lines.append("*STATIC")
 
-    # Boundary conditions (fix)
     for bp in bc_payloads:
         if isinstance(bp.bc, FixBC):
             lines.append("*BOUNDARY")
@@ -427,7 +417,6 @@ def _write_inp(
             if d.get("z"):
                 lines.append(f"BC{bp.idx}, 3, 3, 0.")
 
-    # Loads
     for bp in bc_payloads:
         if not isinstance(bp.bc, LoadBC):
             continue
@@ -436,16 +425,13 @@ def _write_inp(
         if n_nodes == 0:
             continue
 
-        # Determine total force vector (N)
         if load.kind == "force":
             total_mag = float(load.magnitude)
-        else:  # pressure (MPa) — convert to total force by area
+        else:
             total_mag = float(load.magnitude) * float(bp.area)
 
-        # Direction unit vector
         if load.direction == "normal":
             direction = -bp.normal if np.linalg.norm(bp.normal) > 0 else np.zeros(3)
-            # convention: positive magnitude pushes INTO the surface (inward)
         else:
             dx = float(load.direction.get("x", 0.0))
             dy = float(load.direction.get("y", 0.0))
@@ -468,7 +454,6 @@ def _write_inp(
             if abs(fz) > 0:
                 lines.append(f"{int(t)}, 3, {fz:.9g}")
 
-    # Output requests for FRD
     lines.append("*NODE FILE")
     lines.append("U")
     lines.append("*EL FILE")

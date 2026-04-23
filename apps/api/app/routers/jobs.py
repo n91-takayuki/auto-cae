@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import io
 import uuid
 
+import numpy as np
 from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 
 from .. import state
+from ..config import WORKDIR
+from ..frd.parser import parse_frd
 from ..schemas.jobs import FixBC, JobDTO, JobRequest, ResultDTO
 from ..solve.pipeline import run_job
 
@@ -54,6 +59,64 @@ def get_result(job_id: str) -> ResultDTO:
     if j.status != "done" or j.result is None:
         raise HTTPException(409, f"job not finished (status={j.status})")
     return ResultDTO.model_validate(j.result)
+
+
+@router.get("/{job_id}/inp")
+def download_inp(job_id: str) -> FileResponse:
+    j = state.get_job(job_id)
+    if j is None:
+        raise HTTPException(404, "job not found")
+    inp_path = WORKDIR / "jobs" / job_id / "job.inp"
+    if not inp_path.exists():
+        raise HTTPException(404, ".inp not found (job may not have reached solve stage)")
+    return FileResponse(
+        path=str(inp_path),
+        media_type="text/plain",
+        filename=f"{job_id}.inp",
+    )
+
+
+@router.get("/{job_id}/csv")
+def download_csv(job_id: str) -> StreamingResponse:
+    """Per-node CSV: coords (mm), displacement (mm), stress tensor + von Mises (MPa)."""
+    j = state.get_job(job_id)
+    if j is None:
+        raise HTTPException(404, "job not found")
+    if j.status != "done":
+        raise HTTPException(409, f"job not finished (status={j.status})")
+
+    frd_path = WORKDIR / "jobs" / job_id / "job.frd"
+    if not frd_path.exists():
+        raise HTTPException(404, "FRD file not found")
+
+    frd = parse_frd(frd_path)
+
+    buf = io.StringIO()
+    buf.write("# auto_cae job " + job_id + "\n")
+    buf.write("# coords [mm], displacement [mm], stress [MPa]\n")
+    buf.write(
+        "node_id,x,y,z,ux,uy,uz,|U|,sxx,syy,szz,sxy,syz,szx,von_mises\n"
+    )
+    disp_mag = np.linalg.norm(frd.disp, axis=1)
+    rows = np.column_stack([
+        frd.node_ids.astype(np.float64),
+        frd.node_coords,                    # x y z
+        frd.disp,                           # ux uy uz
+        disp_mag,                           # |U|
+        frd.stress,                         # sxx syy szz sxy syz szx
+        frd.von_mises,                      # von_mises
+    ])
+    for row in rows:
+        nid = int(row[0])
+        vals = ",".join(f"{v:.6g}" for v in row[1:])
+        buf.write(f"{nid},{vals}\n")
+
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{job_id}.csv"'},
+    )
 
 
 def _to_dto(j: state.Job) -> JobDTO:

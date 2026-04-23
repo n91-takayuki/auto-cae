@@ -1,5 +1,5 @@
 import { useProject } from "@/store/useProject";
-import { Eye, EyeOff, Grid3x3 } from "lucide-react";
+import { Eye, EyeOff, Grid3x3, Download, FileText } from "lucide-react";
 
 export function ResultLegend() {
   const result = useProject((s) => s.result);
@@ -11,9 +11,12 @@ export function ResultLegend() {
   const showMeshEdges = useProject((s) => s.showMeshEdges);
   const setShowMeshEdges = useProject((s) => s.setShowMeshEdges);
 
+  const job = useProject((s) => s.job);
+
   if (!result) return null;
 
   const { vonMisesMin, vonMisesMax, dispMax } = result.summary;
+  const jobId = result.jobId || job?.id;
 
   // auto-scale baseline (bbox diag * 5%)
   let auto = 1;
@@ -87,6 +90,27 @@ export function ResultLegend() {
           <span>|U|<sub>max</sub></span>
           <span className="font-mono text-slate-200">{dispMax.toExponential(2)} mm</span>
         </div>
+
+        {jobId && (
+          <div className="mt-3 flex gap-1.5 border-t border-stroke/60 pt-2">
+            <a
+              href={`/api/jobs/${jobId}/csv`}
+              download={`${jobId}.csv`}
+              className="flex flex-1 items-center justify-center gap-1 rounded-lg border border-stroke bg-white/5 px-2 py-1 text-[11px] text-slate-200 transition hover:bg-white/10"
+              title="ノード座標+応力をCSVでダウンロード"
+            >
+              <Download className="h-3 w-3" /> CSV
+            </a>
+            <a
+              href={`/api/jobs/${jobId}/inp`}
+              download={`${jobId}.inp`}
+              className="flex flex-1 items-center justify-center gap-1 rounded-lg border border-stroke bg-white/5 px-2 py-1 text-[11px] text-slate-200 transition hover:bg-white/10"
+              title="CalculiX 入力ファイル(.inp)をダウンロード"
+            >
+              <FileText className="h-3 w-3" /> INP
+            </a>
+          </div>
+        )}
       </div>
     </div>
   );

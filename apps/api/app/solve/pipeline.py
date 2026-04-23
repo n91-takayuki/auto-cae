@@ -46,6 +46,11 @@ def run_job(job_id: str, req: JobRequest) -> None:
             progress=_progress_factory(job_id, 0.02, 0.35),
         )
 
+        state.update_job(
+            job_id,
+            message=f"meshed: {mesh.element_count} tet10 [{mesh.strategy_used}]",
+        )
+
         # -- solve --
         state.update_job(job_id, status="solving", progress=0.35, message="running ccx")
         try:
