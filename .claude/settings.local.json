@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(./.venv/Scripts/python.exe -c \"import sys; sys.path.insert\\(0, 'apps/api'\\); from app import main; print\\('ok'\\)\")",
-      "Bash(npx tsc *)",
-      "Bash(git --version)"
-    ]
-  }
-}
