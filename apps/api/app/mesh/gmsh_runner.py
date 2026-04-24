@@ -38,26 +38,36 @@ class MeshResult:
 @dataclass(frozen=True)
 class _Strategy:
     name: str
-    source: str         # "step" -> import OCC STEP   /  "stl" -> rebuild from OCP tessellation
-    heal: bool          # apply OCC heal + remove duplicates after import (step only)
-    algo2d: int         # Mesh.Algorithm   (1=MeshAdapt, 2=Auto, 5=Delaunay, 6=Frontal-Delaunay, 8=FrontalQuad)
+    heal: bool          # apply OCC import-time healing
+    algo2d: int         # Mesh.Algorithm   (1=MeshAdapt, 2=Auto, 5=Delaunay, 6=Frontal-Delaunay)
     algo3d: int         # Mesh.Algorithm3D (1=Delaunay, 4=Frontal, 7=MMG3D, 9=R-tree, 10=HXT)
     order_at_gen: int   # 2: gen tet10 directly. 1: gen tet4, then setOrder(2)
-    heal_tol_scale: float = 1e-5   # OCC tolerance = diag * heal_tol_scale (only when heal=True)
+    # Extra OCC healShapes pass with explicit tolerance = target * heal_tol_target.
+    # 0 = no extra pass. Acts as a natural defeaturer: features smaller than the
+    # tolerance get merged into neighbours.
+    heal_tol_target: float = 0
+    # Explicit defeaturing: remove surfaces with area < (target * defeature_factor)^2,
+    # then let OCC fill the resulting holes. 0 = off.
+    defeature_factor: float = 0
 
 
 _STRATEGIES: list[_Strategy] = [
-    _Strategy("STEP default",            "step", False, 6, 1, 2),
-    _Strategy("STEP HXT",                "step", False, 6, 10, 2),
-    _Strategy("STEP heal + HXT",         "step", True,  6, 10, 2,  heal_tol_scale=1e-5),
-    _Strategy("STEP heal + HXT + lin",   "step", True,  6, 10, 1,  heal_tol_scale=1e-5),
-    _Strategy("STEP heal-loose + HXT",   "step", True,  6, 10, 1,  heal_tol_scale=1e-3),
-    _Strategy("STEP heal + Delaunay",    "step", True,  5, 1,  1,  heal_tol_scale=1e-4),
-    _Strategy("STEP heal + Frontal",     "step", True,  1, 4,  1,  heal_tol_scale=1e-4),
-    # Last resort: rebuild geometry from OCP per-face tessellation as a discrete STL,
-    # then let gmsh classify surfaces and tet-mesh from scratch. Bypasses STEP topology.
-    _Strategy("STL discrete + HXT + lin","stl",  False, 6, 10, 1),
-    _Strategy("STL discrete + Delaunay", "stl",  False, 5, 1,  1),
+    # Fast paths — no healing
+    _Strategy("default (FrontalDelaunay+Delaunay)",   False, 6, 1,  2),
+    _Strategy("HXT 3D",                               False, 6, 10, 2),
+    # Standard healing
+    _Strategy("heal + HXT",                            True, 6, 10, 2),
+    _Strategy("heal + HXT + linear-then-elevate",      True, 6, 10, 1),
+    # Progressive defeaturing through larger healing tolerance.
+    # tol = target * X collapses any feature smaller than X mesh elements.
+    _Strategy("heal tol=target/4 + HXT",               True, 6, 10, 1, heal_tol_target=0.25),
+    _Strategy("heal tol=target/2 + HXT",               True, 6, 10, 1, heal_tol_target=0.5),
+    _Strategy("heal tol=target + HXT",                 True, 6, 10, 1, heal_tol_target=1.0),
+    # Explicit small-face removal via OCC defeature() API.
+    _Strategy("defeature small + HXT",                 True, 6, 10, 1,
+              heal_tol_target=0.5, defeature_factor=0.5),
+    _Strategy("defeature aggressive + HXT",            True, 6, 10, 1,
+              heal_tol_target=1.0, defeature_factor=1.0),
 ]
 
 
@@ -91,10 +101,6 @@ def mesh_and_write_inp(
     else:
         target = max(diag / 20.0 * options.sizeFactor, 1e-3)
 
-    # Pre-build STL once if any STL strategy might be used
-    stl_path = out_dir / "_recon.stl"
-    stl_built = False
-
     with _GMSH_LOCK:
         last_err: Exception | None = None
         for i, strat in enumerate(_STRATEGIES):
@@ -105,41 +111,47 @@ def mesh_and_write_inp(
                 _setup_strategy(gmsh, strat, target, diag)
                 gmsh.model.add("job")
 
-                if strat.source == "step":
-                    p(stage_lo + (stage_hi - stage_lo) * 0.1, "gmsh: importing STEP")
-                    gmsh.model.occ.importShapes(str(step_path))
-                    if strat.heal:
-                        p(stage_lo + (stage_hi - stage_lo) * 0.25, "gmsh: healing geometry")
-                        try:
-                            gmsh.model.occ.healShapes()
-                        except Exception:
-                            pass
-                        try:
-                            gmsh.model.occ.removeAllDuplicates()
-                        except Exception:
-                            pass
-                    gmsh.model.occ.synchronize()
-                else:
-                    # STL discrete reconstruction
-                    if not stl_built:
-                        p(stage_lo + (stage_hi - stage_lo) * 0.05, "stl: building from OCP")
-                        _build_stl_from_geometry(geometry, stl_path)
-                        stl_built = True
-                    p(stage_lo + (stage_hi - stage_lo) * 0.15, "gmsh: loading STL")
-                    gmsh.merge(str(stl_path))
-                    # Classify surfaces by feature angle (40deg) -> recover face structure
-                    angle = 40.0 * np.pi / 180.0
-                    gmsh.model.mesh.classifySurfaces(angle, True, True, np.pi)
-                    gmsh.model.mesh.createGeometry()
-                    # Assemble a Volume from all reconstructed surfaces
-                    surfaces = [s for _d, s in gmsh.model.getEntities(2)]
-                    if not surfaces:
-                        raise RuntimeError("STL reconstruction produced no surfaces")
-                    loop = gmsh.model.geo.addSurfaceLoop(surfaces)
-                    gmsh.model.geo.addVolume([loop])
-                    gmsh.model.geo.synchronize()
+                p(stage_lo + (stage_hi - stage_lo) * 0.1, "gmsh: importing STEP")
+                gmsh.model.occ.importShapes(str(step_path))
 
-                face_id_to_tag = _map_faces_to_gmsh(gmsh, geometry, source=strat.source)
+                if strat.heal:
+                    p(stage_lo + (stage_hi - stage_lo) * 0.2, "gmsh: healing")
+                    try:
+                        gmsh.model.occ.healShapes()
+                    except Exception:
+                        pass
+                    # Extra explicit-tolerance heal pass (acts as a defeaturer).
+                    if strat.heal_tol_target > 0:
+                        large_tol = float(target * strat.heal_tol_target)
+                        try:
+                            gmsh.model.occ.healShapes(
+                                dimTags=[],
+                                tolerance=large_tol,
+                                fixDegenerated=True,
+                                fixSmallEdges=True,
+                                fixSmallFaces=True,
+                                sewFaces=True,
+                                makeSolids=True,
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        gmsh.model.occ.removeAllDuplicates()
+                    except Exception:
+                        pass
+
+                gmsh.model.occ.synchronize()
+
+                # Optional explicit defeaturing: remove small faces below threshold area.
+                if strat.defeature_factor > 0:
+                    n_removed = _defeature_small_faces(
+                        gmsh, geometry, bcs, target, strat.defeature_factor
+                    )
+                    if n_removed > 0:
+                        p(stage_lo + (stage_hi - stage_lo) * 0.3,
+                          f"gmsh: removed {n_removed} small faces")
+
+                face_id_to_tag = _map_faces_to_gmsh(gmsh, geometry)
                 bc_tags = _assign_bc_physical_groups(gmsh, bcs, face_id_to_tag)
 
                 p(stage_lo + (stage_hi - stage_lo) * 0.4, "gmsh: meshing")
@@ -165,9 +177,8 @@ def mesh_and_write_inp(
             raise RuntimeError(
                 f"All {len(_STRATEGIES)} meshing strategies failed. "
                 f"Last error: {last_err}. "
-                f"Try increasing mesh size, simplifying the CAD model "
-                f"(remove sliver faces / fillets / chamfers), "
-                f"or pre-cleaning the STEP in a CAD tool."
+                f"Try increasing the mesh size in the right panel, "
+                f"or simplify the CAD (remove fillets / chamfers / small bosses)."
             )
 
         try:
@@ -250,8 +261,8 @@ def _setup_strategy(gmsh, strat: _Strategy, target: float, diag: float) -> None:
         pass
     gmsh.option.setNumber("General.Terminal", 0)
 
-    if strat.source == "step" and strat.heal:
-        tol = max(diag * strat.heal_tol_scale, 1e-6)
+    if strat.heal:
+        tol = max(diag * 1e-5, 1e-6)
         gmsh.option.setNumber("Geometry.OCCAutoFix", 1)
         gmsh.option.setNumber("Geometry.OCCFixDegenerated", 1)
         gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 1)
@@ -260,7 +271,7 @@ def _setup_strategy(gmsh, strat: _Strategy, target: float, diag: float) -> None:
         gmsh.option.setNumber("Geometry.OCCMakeSolids", 1)
         gmsh.option.setNumber("Geometry.Tolerance", tol)
         gmsh.option.setNumber("Geometry.ToleranceBoolean", tol)
-    elif strat.source == "step":
+    else:
         gmsh.option.setNumber("Geometry.OCCAutoFix", 0)
         gmsh.option.setNumber("Geometry.OCCFixDegenerated", 0)
         gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 0)
@@ -289,15 +300,8 @@ def _has_tet10(gmsh) -> bool:
 
 # --------------------------------------------------------------------- mapping
 
-def _map_faces_to_gmsh(
-    gmsh, geometry: GeometryPayload, source: str = "step"
-) -> dict[int, int]:
-    """Match OCP face_id -> gmsh surface tag via centroid nearest-neighbour.
-
-    For STEP-imported entities, use OCC's exact center-of-mass.
-    For STL-reconstructed entities, fall back to bounding-box center
-    (OCC center is unavailable for non-OCC entities).
-    """
+def _map_faces_to_gmsh(gmsh, geometry: GeometryPayload) -> dict[int, int]:
+    """Match OCP face_id -> gmsh surface tag via centroid nearest-neighbour."""
     ocp_centroids: dict[int, np.ndarray] = {}
     for f in geometry.faces:
         pts = np.asarray(f.positions, dtype=np.float64).reshape(-1, 3)
@@ -309,18 +313,15 @@ def _map_faces_to_gmsh(
     gmsh_centroids: dict[int, np.ndarray] = {}
     for t in gmsh_tags:
         try:
-            if source == "step":
-                cx, cy, cz = gmsh.model.occ.getCenterOfMass(2, t)
-            else:
+            cx, cy, cz = gmsh.model.occ.getCenterOfMass(2, t)
+        except Exception:
+            try:
                 xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, t)
                 cx = (xmin + xmax) * 0.5
                 cy = (ymin + ymax) * 0.5
                 cz = (zmin + zmax) * 0.5
-        except Exception:
-            xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, t)
-            cx = (xmin + xmax) * 0.5
-            cy = (ymin + ymax) * 0.5
-            cz = (zmin + zmax) * 0.5
+            except Exception:
+                continue
         gmsh_centroids[t] = np.array([cx, cy, cz], dtype=np.float64)
 
     mapping: dict[int, int] = {}
@@ -337,34 +338,71 @@ def _map_faces_to_gmsh(
     return mapping
 
 
-def _build_stl_from_geometry(geometry: GeometryPayload, path: Path) -> None:
-    """Write the OCP per-face surface tessellation as a single ASCII STL.
+def _defeature_small_faces(
+    gmsh,
+    geometry: GeometryPayload,
+    bcs: list[BC],
+    target: float,
+    factor: float,
+) -> int:
+    """Automatically remove surfaces smaller than (target * factor)^2.
 
-    This reconstructs a watertight (assuming the OCP triangulation was complete)
-    discrete surface that gmsh can re-mesh independent of the original STEP
-    topology — useful for CAD with sliver faces, missing booleans, or
-    extreme parameterisations that defeat OCC's mesher.
+    Uses OCC's defeature() which suppresses the specified surfaces and fills
+    the resulting holes by extending neighbouring surfaces. Faster than
+    re-meshing from scratch because the overall parametric geometry is kept.
+
+    BC-tagged surfaces are protected: we compute protected centroids from
+    ``geometry.faces`` (the original OCP face_ids) and skip any gmsh surface
+    whose centroid is within one mesh element of a BC face centroid.
     """
-    with open(path, "w", encoding="ascii") as f:
-        f.write("solid model\n")
-        for face in geometry.faces:
-            pts = np.asarray(face.positions, dtype=np.float64).reshape(-1, 3)
-            idx = np.asarray(face.indices, dtype=np.int64).reshape(-1, 3)
-            for tri in idx:
-                a, b, c = pts[tri[0]], pts[tri[1]], pts[tri[2]]
-                n = np.cross(b - a, c - a)
-                ln = float(np.linalg.norm(n))
-                if ln < 1e-18:
-                    continue
-                n = n / ln
-                f.write(f"  facet normal {n[0]:.6e} {n[1]:.6e} {n[2]:.6e}\n")
-                f.write("    outer loop\n")
-                f.write(f"      vertex {a[0]:.6e} {a[1]:.6e} {a[2]:.6e}\n")
-                f.write(f"      vertex {b[0]:.6e} {b[1]:.6e} {b[2]:.6e}\n")
-                f.write(f"      vertex {c[0]:.6e} {c[1]:.6e} {c[2]:.6e}\n")
-                f.write("    endloop\n")
-                f.write("  endfacet\n")
-        f.write("endsolid model\n")
+    threshold_area = (target * factor) ** 2
+
+    # Protected centroids = OCP faces that have BC assignments
+    protected_face_ids: set[int] = set()
+    for bc in bcs:
+        for fid in bc.faceIds:
+            protected_face_ids.add(int(fid))
+    protected_centroids: list[np.ndarray] = []
+    for f in geometry.faces:
+        if f.face_id in protected_face_ids:
+            pts = np.asarray(f.positions, dtype=np.float64).reshape(-1, 3)
+            if pts.size > 0:
+                protected_centroids.append(pts.mean(axis=0))
+
+    surface_tags = [t for _d, t in gmsh.model.getEntities(2)]
+    to_remove: list[int] = []
+    for t in surface_tags:
+        try:
+            area = float(gmsh.model.occ.getMass(2, t))
+        except Exception:
+            continue
+        if area >= threshold_area:
+            continue
+        try:
+            cx, cy, cz = gmsh.model.occ.getCenterOfMass(2, t)
+        except Exception:
+            continue
+        c = np.array([cx, cy, cz], dtype=np.float64)
+        # Skip surfaces that are near a BC face centroid
+        is_protected = any(
+            float(np.linalg.norm(c - pc)) < target for pc in protected_centroids
+        )
+        if not is_protected:
+            to_remove.append(int(t))
+
+    if not to_remove:
+        return 0
+
+    volume_tags = [int(t) for _d, t in gmsh.model.getEntities(3)]
+    if not volume_tags:
+        return 0
+
+    try:
+        gmsh.model.occ.defeature(volume_tags, to_remove)
+        gmsh.model.occ.synchronize()
+        return len(to_remove)
+    except Exception:
+        return 0
 
 
 def _assign_bc_physical_groups(
