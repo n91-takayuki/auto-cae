@@ -163,6 +163,19 @@ def mesh_and_write_inp(
                 if not _has_tet10(gmsh):
                     raise RuntimeError("no tet10 elements produced")
 
+                ok, total, bad = _check_quality(gmsh)
+                if not ok:
+                    # Try high-order repair before giving up on this strategy
+                    p(stage_lo + (stage_hi - stage_lo) * 0.9,
+                      f"gmsh: repairing {bad}/{total} bad elements")
+                    _try_repair_high_order(gmsh)
+                    ok, total, bad = _check_quality(gmsh)
+                if not ok:
+                    raise RuntimeError(
+                        f"mesh quality unacceptable: {bad}/{total} elements have "
+                        f"negative Jacobian (curved tet10 self-intersection)"
+                    )
+
                 used = strat
                 break
 
@@ -288,14 +301,60 @@ def _setup_strategy(gmsh, strat: _Strategy, target: float, diag: float) -> None:
     gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
     gmsh.option.setNumber("Mesh.Algorithm", strat.algo2d)
     gmsh.option.setNumber("Mesh.Algorithm3D", strat.algo3d)
-    # Allow some optimisation passes — improves robustness on bad input
+    # Optimization: aggressive defaults to combat negative-Jacobian curved tets
     gmsh.option.setNumber("Mesh.Optimize", 1)
-    gmsh.option.setNumber("Mesh.OptimizeNetgen", 0)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+    gmsh.option.setNumber("Mesh.OptimizeThreshold", 0.3)
+    # HighOrderOptimize: 0=none, 1=optimization, 2=elastic+optimization, 3=elastic, 4=fast curving
+    # 2 is the most robust for curved tet10 against self-intersection
+    gmsh.option.setNumber("Mesh.HighOrderOptimize", 2)
+    gmsh.option.setNumber("Mesh.HighOrderPassMax", 25)
+    gmsh.option.setNumber("Mesh.HighOrderThresholdMin", 0.1)
+    gmsh.option.setNumber("Mesh.HighOrderThresholdMax", 2.0)
 
 
 def _has_tet10(gmsh) -> bool:
     et_types, _, _ = gmsh.model.mesh.getElements(dim=3)
     return any(int(t) == 11 for t in et_types)
+
+
+def _check_quality(gmsh, max_bad_ratio: float = 0.005) -> tuple[bool, int, int]:
+    """Return (is_ok, total_count, bad_count) for tet10 elements.
+
+    A "bad" element has minimum scaled Jacobian < 0 (inverted / self-intersecting
+    curved second-order element). CalculiX rejects or fails to converge with
+    these. Even a small fraction (~0.5%) is usually unsafe for a static analysis.
+    """
+    et_types, et_tags, _ = gmsh.model.mesh.getElements(dim=3)
+    total = 0
+    bad = 0
+    for code, tags in zip(et_types, et_tags):
+        if int(code) != 11:  # tet10 only
+            continue
+        tag_list = [int(t) for t in tags]
+        total += len(tag_list)
+        if not tag_list:
+            continue
+        try:
+            q = gmsh.model.mesh.getElementQualities(tag_list, "minSJ")
+            for v in q:
+                if float(v) <= 0.0:
+                    bad += 1
+        except Exception:
+            # If quality query fails, fall back to a more conservative check
+            return False, total, total
+    if total == 0:
+        return False, 0, 0
+    return (bad / total) <= max_bad_ratio, total, bad
+
+
+def _try_repair_high_order(gmsh) -> None:
+    """Run additional high-order optimization passes (elastic + smoothing)."""
+    for method in ("HighOrderElastic", "HighOrder", "Netgen"):
+        try:
+            gmsh.model.mesh.optimize(method, force=True)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------- mapping
