@@ -429,44 +429,42 @@ function Row({ label, value, mono = false }: { label: string; value: string; mon
 }
 
 function MeshSizeField() {
-  const factor = useProject((s) => s.meshSizeFactor);
-  const setFactor = useProject((s) => s.setMeshSizeFactor);
-  const project = useProject((s) => s.project);
-
-  // Auto target = bbox diagonal / 20
-  let approxMm: number | null = null;
-  if (project) {
-    const sx = project.bboxMax[0] - project.bboxMin[0];
-    const sy = project.bboxMax[1] - project.bboxMin[1];
-    const sz = project.bboxMax[2] - project.bboxMin[2];
-    const diag = Math.hypot(sx, sy, sz);
-    approxMm = (diag / 20) * factor;
-  }
+  const sizeMm = useProject((s) => s.meshSizeMm);
+  const setSizeMm = useProject((s) => s.setMeshSizeMm);
 
   return (
     <div className="rounded-lg border border-stroke/60 bg-white/[0.02] px-2.5 py-1.5">
       <div className="flex items-center justify-between">
         <span className="text-[12px] text-slate-400">メッシュサイズ</span>
-        <span className="font-mono text-[12px] text-slate-200">
-          {factor.toFixed(2)}×
-          {approxMm !== null && (
-            <span className="ml-1 text-slate-500">≈ {approxMm.toFixed(2)} mm</span>
-          )}
-        </span>
+        <div className="flex items-center gap-1">
+          <input
+            type="number"
+            min={1}
+            max={10}
+            step={0.1}
+            value={sizeMm}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              if (Number.isFinite(v)) setSizeMm(Math.min(10, Math.max(1, v)));
+            }}
+            className="w-16 rounded-md border border-stroke/60 bg-black/30 px-1.5 py-0.5 text-right font-mono text-[12px] text-slate-200 outline-none focus:border-cyan-400/60"
+          />
+          <span className="font-mono text-[11px] text-slate-500">mm</span>
+        </div>
       </div>
       <input
         type="range"
-        min={0.3}
-        max={3.0}
-        step={0.05}
-        value={factor}
-        onChange={(e) => setFactor(Number(e.target.value))}
+        min={1}
+        max={10}
+        step={0.1}
+        value={sizeMm}
+        onChange={(e) => setSizeMm(Number(e.target.value))}
         className="mt-1 w-full accent-cyan-400"
       />
-      <div className="flex justify-between text-[9px] uppercase tracking-wider text-slate-500">
-        <span>細かい</span>
-        <span>標準</span>
-        <span>粗い</span>
+      <div className="flex justify-between font-mono text-[10px] text-slate-500">
+        <span>1 mm</span>
+        <span>5</span>
+        <span>10 mm</span>
       </div>
     </div>
   );

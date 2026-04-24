@@ -53,7 +53,8 @@ class Material(BaseModel):
 
 class MeshOptions(BaseModel):
     element: Literal["tet10"] = "tet10"
-    sizeFactor: float = 1.0  # 1.0 = auto (bbox-based)
+    sizeMm: float | None = None  # absolute target element size in mm; None = auto
+    sizeFactor: float = 1.0      # legacy: multiplier on bbox-based auto size
 
 
 class JobRequest(BaseModel):

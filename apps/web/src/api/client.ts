@@ -54,7 +54,7 @@ export type JobRequestDTO = {
   projectId: string;
   bcs: BCInput[];
   material?: MaterialInput;
-  mesh?: { element?: "tet10"; sizeFactor?: number };
+  mesh?: { element?: "tet10"; sizeMm?: number; sizeFactor?: number };
 };
 
 export type JobStatus =

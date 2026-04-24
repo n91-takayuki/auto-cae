@@ -76,11 +76,14 @@ def mesh_and_write_inp(
         if progress:
             progress(v, msg)
 
-    # Characteristic size from bbox diagonal (deterministic from user input)
+    # Characteristic size: explicit sizeMm wins, otherwise bbox / 20 * sizeFactor.
     xmin, ymin, zmin = geometry.bbox_min
     xmax, ymax, zmax = geometry.bbox_max
     diag = float(((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2) ** 0.5)
-    target = max(diag / 20.0 * options.sizeFactor, 1e-3)
+    if options.sizeMm is not None and options.sizeMm > 0:
+        target = float(options.sizeMm)
+    else:
+        target = max(diag / 20.0 * options.sizeFactor, 1e-3)
 
     with _GMSH_LOCK:
         last_err: Exception | None = None

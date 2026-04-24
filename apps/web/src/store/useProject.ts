@@ -52,7 +52,7 @@ type State = {
   material: MaterialSpec;
   history: JobDTO[];
 
-  meshSizeFactor: number;
+  meshSizeMm: number;
   showMeshEdges: boolean;
 
   placementMode: PlacementMode;
@@ -67,7 +67,7 @@ type State = {
   setDispScale: (v: number) => void;
   setShowResult: (v: boolean) => void;
   setMaterial: (m: MaterialSpec) => void;
-  setMeshSizeFactor: (v: number) => void;
+  setMeshSizeMm: (v: number) => void;
   setShowMeshEdges: (v: boolean) => void;
   loadJobResult: (jobId: string) => Promise<void>;
 
@@ -107,7 +107,7 @@ export const useProject = create<State>((set, get) => ({
   showResult: true,
   material: DEFAULT_MATERIAL,
   history: [],
-  meshSizeFactor: 1.0,
+  meshSizeMm: 5,
   showMeshEdges: false,
 
   placementMode: null,
@@ -123,7 +123,7 @@ export const useProject = create<State>((set, get) => ({
   setDispScale: (v) => set({ dispScale: v }),
   setShowResult: (v) => set({ showResult: v }),
   setMaterial: (m) => set({ material: m }),
-  setMeshSizeFactor: (v) => set({ meshSizeFactor: v }),
+  setMeshSizeMm: (v) => set({ meshSizeMm: v }),
   setShowMeshEdges: (v) => set({ showMeshEdges: v }),
   loadJobResult: async (jobId) => {
     try {
@@ -282,7 +282,7 @@ export const useProject = create<State>((set, get) => ({
           poisson: mat.poisson,
           density: mat.density,
         },
-        mesh: { sizeFactor: s.meshSizeFactor },
+        mesh: { sizeMm: s.meshSizeMm },
       });
       set({ job, history: [job, ...get().history.slice(0, 19)] });
       get().log("info", `ジョブ送信: ${job.id} · ${mat.name}`);
