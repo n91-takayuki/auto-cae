@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from .. import state
 from ..config import WORKDIR
 from ..frd.parser import parse_frd
-from ..schemas.jobs import FixBC, JobDTO, JobRequest, ResultDTO
+from ..schemas.jobs import FixBC, JobDTO, JobRequest, LoadBC, ResultDTO
 from ..solve.pipeline import run_job
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -35,6 +35,12 @@ def create_job(req: JobRequest, bg: BackgroundTasks) -> JobDTO:
     # Unit/BC sanity: need at least one Fix (otherwise rigid-body modes)
     if not any(isinstance(bc, FixBC) for bc in req.bcs):
         raise HTTPException(422, "at least one fix constraint is required")
+    if not any(isinstance(bc, LoadBC) for bc in req.bcs):
+        raise HTTPException(
+            422,
+            "at least one load is required (without a load the stress field is "
+            "trivially zero)",
+        )
 
     job_id = uuid.uuid4().hex[:12]
     job = state.Job(id=job_id, project_id=req.projectId, status="queued", progress=0.0)
@@ -59,6 +65,21 @@ def get_result(job_id: str) -> ResultDTO:
     if j.status != "done" or j.result is None:
         raise HTTPException(409, f"job not finished (status={j.status})")
     return ResultDTO.model_validate(j.result)
+
+
+@router.get("/{job_id}/repair-csv")
+def download_repair_csv(job_id: str) -> FileResponse:
+    j = state.get_job(job_id)
+    if j is None:
+        raise HTTPException(404, "job not found")
+    path = WORKDIR / "jobs" / job_id / "mesh_repair.csv"
+    if not path.exists():
+        raise HTTPException(404, "no repair log (no bad elements detected)")
+    return FileResponse(
+        path=str(path),
+        media_type="text/csv",
+        filename=f"{job_id}_mesh_repair.csv",
+    )
 
 
 @router.get("/{job_id}/inp")

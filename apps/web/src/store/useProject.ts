@@ -256,6 +256,10 @@ export const useProject = create<State>((set, get) => ({
       s.log("error", "少なくとも1つの拘束条件が必要です");
       return;
     }
+    if (!s.bcs.some((b) => b.type === "load")) {
+      s.log("error", "少なくとも1つの荷重が必要です(無いと応力は常に0)");
+      return;
+    }
 
     const bcInputs: BCInput[] = s.bcs.map((b) =>
       b.type === "fix"

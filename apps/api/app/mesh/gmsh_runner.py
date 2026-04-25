@@ -1,10 +1,18 @@
 """Gmsh meshing + CalculiX .inp writing with BC injection.
 
-This module is single-threaded (gmsh is a process-global singleton).
-Callers must serialize via the module-level lock in ``mesh_and_write_inp``.
+Each meshing strategy is executed in a fresh Python subprocess. This is
+required because gmsh's OCC engine retains corrupted state after a failed
+strategy attempt — even ``gmsh.finalize()`` + ``gmsh.initialize()`` does not
+fully reset it within the same Python process. Strategies that succeed in
+isolation silently produce zero elements when run after a failed strategy in
+the same process. Subprocess isolation guarantees a clean OCC state per
+attempt.
 """
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -18,6 +26,8 @@ from ..schemas.jobs import BC, FixBC, LoadBC, Material, MeshOptions
 ProgressFn = Callable[[float, str], None]
 
 _GMSH_LOCK = Lock()
+_WORKER_PATH = Path(__file__).parent / "_worker.py"
+_WORKER_TIMEOUT_S = 300.0
 
 
 @dataclass
@@ -30,44 +40,39 @@ class MeshResult:
     tet_conn: np.ndarray        # int64, shape (E, 10)
     surface_tris: np.ndarray    # int64, shape (T, 3)
     strategy_used: str = ""
+    repaired_count: int = 0           # elements whose midside nodes were flattened
+    repaired_centroids: list[tuple[float, float, float]] | None = None
+    dropped_count: int = 0            # elements still bad after repair (reported only)
+    dropped_centroids: list[tuple[float, float, float]] | None = None
+    repair_csv_path: Path | None = None
 
 
-# Meshing strategies tried in order. Each has progressively more aggressive
-# healing / more robust algorithms. We do not change the user-requested mesh
-# size in any of them (size is the user's responsibility).
+# Meshing strategies tried in order. Speed-first: only 3 strategies, no OCC
+# healing (which can raise "Could not fix wire" on pathological STEPs and is
+# slow anyway). Element quality is repaired post-generation via midside
+# node flattening. Final fallback is linear C3D4 which is inherently immune
+# to curved-edge self-intersection.
 @dataclass(frozen=True)
 class _Strategy:
     name: str
-    heal: bool          # apply OCC import-time healing
-    algo2d: int         # Mesh.Algorithm   (1=MeshAdapt, 2=Auto, 5=Delaunay, 6=Frontal-Delaunay)
-    algo3d: int         # Mesh.Algorithm3D (1=Delaunay, 4=Frontal, 7=MMG3D, 9=R-tree, 10=HXT)
-    order_at_gen: int   # 2: gen tet10 directly. 1: gen tet4, then setOrder(2)
-    # Extra OCC healShapes pass with explicit tolerance = target * heal_tol_target.
-    # 0 = no extra pass. Acts as a natural defeaturer: features smaller than the
-    # tolerance get merged into neighbours.
-    heal_tol_target: float = 0
-    # Explicit defeaturing: remove surfaces with area < (target * defeature_factor)^2,
-    # then let OCC fill the resulting holes. 0 = off.
-    defeature_factor: float = 0
+    algo2d: int         # Mesh.Algorithm   (6=Frontal-Delaunay, 5=Delaunay, 1=MeshAdapt)
+    algo3d: int         # Mesh.Algorithm3D (10=HXT, 1=Delaunay, 4=Frontal)
+    order_at_gen: int   # 2=generate tet10 directly, 1=generate tet4 first
+    elevate: bool       # after generate: True -> setOrder(2) to get tet10, False -> keep tet4
 
 
 _STRATEGIES: list[_Strategy] = [
-    # Fast paths — no healing
-    _Strategy("default (FrontalDelaunay+Delaunay)",   False, 6, 1,  2),
-    _Strategy("HXT 3D",                               False, 6, 10, 2),
-    # Standard healing
-    _Strategy("heal + HXT",                            True, 6, 10, 2),
-    _Strategy("heal + HXT + linear-then-elevate",      True, 6, 10, 1),
-    # Progressive defeaturing through larger healing tolerance.
-    # tol = target * X collapses any feature smaller than X mesh elements.
-    _Strategy("heal tol=target/4 + HXT",               True, 6, 10, 1, heal_tol_target=0.25),
-    _Strategy("heal tol=target/2 + HXT",               True, 6, 10, 1, heal_tol_target=0.5),
-    _Strategy("heal tol=target + HXT",                 True, 6, 10, 1, heal_tol_target=1.0),
-    # Explicit small-face removal via OCC defeature() API.
-    _Strategy("defeature small + HXT",                 True, 6, 10, 1,
-              heal_tol_target=0.5, defeature_factor=0.5),
-    _Strategy("defeature aggressive + HXT",            True, 6, 10, 1,
-              heal_tol_target=1.0, defeature_factor=1.0),
+    # 1. Fast path: direct tet10 with aggressive HO-optimization (HXT 3D).
+    _Strategy("fast tet10 (HXT)",            6, 10, 2, True),
+    # 2. Robust path: linear first, then elevate (HXT). Usually passes where (1) fails.
+    _Strategy("robust tet10 (HXT lin+elev)", 6, 10, 1, True),
+    # 3. Frontal 3D — different boundary recovery, succeeds on geometries with
+    #    self-intersecting surface mesh (e.g. spiral threads) where HXT raises
+    #    PLC errors.
+    _Strategy("Frontal tet10 (lin+elev)",    6,  4, 1, True),
+    # 4. Last resort: pure tet4 with Frontal. No curvature, lenient boundary
+    #    recovery — guaranteed to converge if any 3D mesh is possible.
+    _Strategy("Frontal tet4 (C3D4)",         6,  4, 1, False),
 ]
 
 
@@ -80,193 +85,102 @@ def mesh_and_write_inp(
     options: MeshOptions,
     progress: ProgressFn | None = None,
 ) -> MeshResult:
-    """Load STEP via gmsh, mesh to tet10, and write a CalculiX .inp with BCs.
+    """Run each meshing strategy in a fresh subprocess; return on first success.
 
-    Tries multiple strategies in order; the first that produces a valid tet10
-    mesh wins. Mesh size is taken verbatim from ``options.sizeFactor`` and is
-    NOT altered between strategies.
+    The geometry parameter is kept for API compatibility but the worker
+    re-loads it from ``step_path`` (cheap; gives the worker a clean state).
     """
-    import gmsh
+    del geometry  # unused in parent (worker re-loads from step_path)
 
     def p(v: float, msg: str) -> None:
         if progress:
             progress(v, msg)
 
-    # Characteristic size: explicit sizeMm wins, otherwise bbox / 20 * sizeFactor.
-    xmin, ymin, zmin = geometry.bbox_min
-    xmax, ymax, zmax = geometry.bbox_max
-    diag = float(((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2) ** 0.5)
+    # Characteristic size: explicit sizeMm wins, else heuristic from sizeFactor.
     if options.sizeMm is not None and options.sizeMm > 0:
         target = float(options.sizeMm)
     else:
-        target = max(diag / 20.0 * options.sizeFactor, 1e-3)
+        target = max(1.0 * options.sizeFactor, 1e-3)
 
+    out_dir.mkdir(parents=True, exist_ok=True)
+    input_json = out_dir / "_worker_input.json"
+
+    last_err = "(no strategy ran)"
     with _GMSH_LOCK:
-        last_err: Exception | None = None
         for i, strat in enumerate(_STRATEGIES):
             stage_lo = 0.05 + 0.55 * (i / len(_STRATEGIES))
             stage_hi = 0.05 + 0.55 * ((i + 1) / len(_STRATEGIES))
             p(stage_lo, f"gmsh: try [{strat.name}]")
+
+            payload = {
+                "step_path": str(step_path),
+                "out_dir": str(out_dir),
+                "target": target,
+                "strategy_name": strat.name,
+                "bcs": [bc.model_dump() for bc in bcs],
+                "material": material.model_dump(),
+            }
+            input_json.write_text(json.dumps(payload), encoding="utf-8")
+
             try:
-                _setup_strategy(gmsh, strat, target, diag)
-                gmsh.model.add("job")
-
-                p(stage_lo + (stage_hi - stage_lo) * 0.1, "gmsh: importing STEP")
-                gmsh.model.occ.importShapes(str(step_path))
-
-                if strat.heal:
-                    p(stage_lo + (stage_hi - stage_lo) * 0.2, "gmsh: healing")
-                    try:
-                        gmsh.model.occ.healShapes()
-                    except Exception:
-                        pass
-                    # Extra explicit-tolerance heal pass (acts as a defeaturer).
-                    if strat.heal_tol_target > 0:
-                        large_tol = float(target * strat.heal_tol_target)
-                        try:
-                            gmsh.model.occ.healShapes(
-                                dimTags=[],
-                                tolerance=large_tol,
-                                fixDegenerated=True,
-                                fixSmallEdges=True,
-                                fixSmallFaces=True,
-                                sewFaces=True,
-                                makeSolids=True,
-                            )
-                        except Exception:
-                            pass
-                    try:
-                        gmsh.model.occ.removeAllDuplicates()
-                    except Exception:
-                        pass
-
-                gmsh.model.occ.synchronize()
-
-                # Optional explicit defeaturing: remove small faces below threshold area.
-                if strat.defeature_factor > 0:
-                    n_removed = _defeature_small_faces(
-                        gmsh, geometry, bcs, target, strat.defeature_factor
-                    )
-                    if n_removed > 0:
-                        p(stage_lo + (stage_hi - stage_lo) * 0.3,
-                          f"gmsh: removed {n_removed} small faces")
-
-                face_id_to_tag = _map_faces_to_gmsh(gmsh, geometry)
-                bc_tags = _assign_bc_physical_groups(gmsh, bcs, face_id_to_tag)
-
-                p(stage_lo + (stage_hi - stage_lo) * 0.4, "gmsh: meshing")
-                gmsh.model.mesh.generate(3)
-                if strat.order_at_gen == 1:
-                    p(stage_lo + (stage_hi - stage_lo) * 0.8, "gmsh: elevating to order 2")
-                    gmsh.model.mesh.setOrder(2)
-
-                if not _has_tet10(gmsh):
-                    raise RuntimeError("no tet10 elements produced")
-
-                ok, total, bad = _check_quality(gmsh)
-                if not ok:
-                    # Try high-order repair before giving up on this strategy
-                    p(stage_lo + (stage_hi - stage_lo) * 0.9,
-                      f"gmsh: repairing {bad}/{total} bad elements")
-                    _try_repair_high_order(gmsh)
-                    ok, total, bad = _check_quality(gmsh)
-                if not ok:
-                    raise RuntimeError(
-                        f"mesh quality unacceptable: {bad}/{total} elements have "
-                        f"negative Jacobian (curved tet10 self-intersection)"
-                    )
-
-                used = strat
-                break
-
-            except Exception as e:
-                last_err = e
-                try:
-                    gmsh.clear()
-                except Exception:
-                    pass
+                proc = subprocess.run(
+                    [sys.executable, str(_WORKER_PATH), str(input_json)],
+                    capture_output=True,
+                    timeout=_WORKER_TIMEOUT_S,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except subprocess.TimeoutExpired:
+                last_err = f"[{strat.name}] timed out after {_WORKER_TIMEOUT_S:.0f}s"
                 continue
-        else:
-            raise RuntimeError(
-                f"All {len(_STRATEGIES)} meshing strategies failed. "
-                f"Last error: {last_err}. "
-                f"Try increasing the mesh size in the right panel, "
-                f"or simplify the CAD (remove fillets / chamfers / small bosses)."
-            )
 
-        try:
-            p(0.65, "gmsh: extracting mesh")
-            node_tags_raw, coords_flat, _ = gmsh.model.mesh.getNodes()
-            node_tags = np.asarray(node_tags_raw, dtype=np.int64)
-            coords = np.asarray(coords_flat, dtype=np.float64).reshape(-1, 3)
-            tag_to_idx = {int(t): i for i, t in enumerate(node_tags)}
+            if proc.returncode == 0:
+                p(stage_hi, f"loading mesh from worker [{strat.name}]")
+                return _load_worker_outputs(out_dir, strat)
 
-            et_types, _et_tags, et_conn = gmsh.model.mesh.getElements(dim=3)
-            tet_conn_idx: list[list[int]] = []
-            for tcode, conn in zip(et_types, et_conn):
-                if tcode != 11:
-                    continue
-                arr = np.asarray(conn, dtype=np.int64).reshape(-1, 10)
-                for row in arr:
-                    tet_conn_idx.append([tag_to_idx[int(x)] for x in row])
-            if not tet_conn_idx:
-                raise RuntimeError("gmsh produced no tet10 elements after extraction")
-            tet_conn_arr = np.asarray(tet_conn_idx, dtype=np.int64)
+            err_lines = (proc.stderr or "").strip().splitlines()
+            last_err = err_lines[-1] if err_lines else f"[{strat.name}] exit {proc.returncode}"
+            continue
 
-            surface_tris: list[list[int]] = []
-            for _dim, tag in gmsh.model.getEntities(2):
-                st_types, _st_tags, st_conn = gmsh.model.mesh.getElements(dim=2, tag=tag)
-                for stype, sconn in zip(st_types, st_conn):
-                    if stype == 9:
-                        arr = np.asarray(sconn, dtype=np.int64).reshape(-1, 6)
-                        for row in arr:
-                            surface_tris.append([
-                                tag_to_idx[int(row[0])],
-                                tag_to_idx[int(row[1])],
-                                tag_to_idx[int(row[2])],
-                            ])
-                    elif stype == 2:
-                        arr = np.asarray(sconn, dtype=np.int64).reshape(-1, 3)
-                        for row in arr:
-                            surface_tris.append([tag_to_idx[int(x)] for x in row])
-            surface_tris_arr = (
-                np.asarray(surface_tris, dtype=np.int64)
-                if surface_tris
-                else np.zeros((0, 3), dtype=np.int64)
-            )
-
-            bc_payloads = _collect_bc_payloads(gmsh, bcs, bc_tags, coords, tag_to_idx)
-
-            p(0.80, "writing .inp")
-            inp_path = out_dir / "job.inp"
-            _write_inp(
-                inp_path=inp_path,
-                node_tags=node_tags,
-                coords=coords,
-                tet_conn=tet_conn_arr,
-                tag_to_idx=tag_to_idx,
-                bc_payloads=bc_payloads,
-                material=material,
-            )
-
-            return MeshResult(
-                inp_path=inp_path,
-                node_count=int(node_tags.size),
-                element_count=int(tet_conn_arr.shape[0]),
-                node_tags=node_tags,
-                node_coords=coords,
-                tet_conn=tet_conn_arr,
-                surface_tris=surface_tris_arr,
-                strategy_used=used.name,
-            )
-        finally:
-            try:
-                gmsh.clear()
-            except Exception:
-                pass
+    raise RuntimeError(
+        f"All {len(_STRATEGIES)} meshing strategies failed. "
+        f"Last error: {last_err}. "
+        f"Likely causes: (1) threading or spiral features that gmsh cannot "
+        f"surface-mesh cleanly, (2) STEP topology gaps. "
+        f"Workarounds: increase the mesh size; simplify the CAD in FreeCAD/"
+        f"Fusion 360 by suppressing threads/fillets; or export the model as "
+        f"a single body without threads."
+    )
 
 
-def _setup_strategy(gmsh, strat: _Strategy, target: float, diag: float) -> None:
+def _load_worker_outputs(out_dir: Path, strat: "_Strategy") -> MeshResult:
+    """Load the artifacts written by a successful subprocess worker run."""
+    result_path = out_dir / "result.json"
+    npz_path = out_dir / "mesh.npz"
+    if not result_path.exists() or not npz_path.exists():
+        raise RuntimeError("worker reported success but artifacts are missing")
+
+    info = json.loads(result_path.read_text(encoding="utf-8"))
+    data = np.load(npz_path)
+    return MeshResult(
+        inp_path=out_dir / "job.inp",
+        node_count=int(info["node_count"]),
+        element_count=int(info["element_count"]),
+        node_tags=data["node_tags"],
+        node_coords=data["node_coords"],
+        tet_conn=data["tet_conn"],
+        surface_tris=data["surface_tris"],
+        strategy_used=str(info.get("strategy_used", strat.name)),
+        repaired_count=int(info.get("repaired_count", 0)),
+        repaired_centroids=[tuple(c) for c in info.get("repaired_centroids", [])],
+        dropped_count=int(info.get("dropped_count", 0)),
+        dropped_centroids=[tuple(c) for c in info.get("dropped_centroids", [])],
+        repair_csv_path=out_dir / "mesh_repair.csv",
+    )
+
+
+def _setup_strategy(gmsh, strat: _Strategy, target: float) -> None:
     """Reset gmsh state and configure options for this strategy attempt."""
     try:
         gmsh.clear()
@@ -274,22 +188,13 @@ def _setup_strategy(gmsh, strat: _Strategy, target: float, diag: float) -> None:
         pass
     gmsh.option.setNumber("General.Terminal", 0)
 
-    if strat.heal:
-        tol = max(diag * 1e-5, 1e-6)
-        gmsh.option.setNumber("Geometry.OCCAutoFix", 1)
-        gmsh.option.setNumber("Geometry.OCCFixDegenerated", 1)
-        gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 1)
-        gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 1)
-        gmsh.option.setNumber("Geometry.OCCSewFaces", 1)
-        gmsh.option.setNumber("Geometry.OCCMakeSolids", 1)
-        gmsh.option.setNumber("Geometry.Tolerance", tol)
-        gmsh.option.setNumber("Geometry.ToleranceBoolean", tol)
-    else:
-        gmsh.option.setNumber("Geometry.OCCAutoFix", 0)
-        gmsh.option.setNumber("Geometry.OCCFixDegenerated", 0)
-        gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 0)
-        gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 0)
-        gmsh.option.setNumber("Geometry.OCCSewFaces", 0)
+    # Healing is OFF for all strategies: slow + can raise "Could not fix wire".
+    # Element quality is repaired post-generation via midside flattening.
+    gmsh.option.setNumber("Geometry.OCCAutoFix", 0)
+    gmsh.option.setNumber("Geometry.OCCFixDegenerated", 0)
+    gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 0)
+    gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 0)
+    gmsh.option.setNumber("Geometry.OCCSewFaces", 0)
 
     # Mesh size — kept identical across strategies (per user requirement)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", target * 0.25)
@@ -316,6 +221,11 @@ def _setup_strategy(gmsh, strat: _Strategy, target: float, diag: float) -> None:
 def _has_tet10(gmsh) -> bool:
     et_types, _, _ = gmsh.model.mesh.getElements(dim=3)
     return any(int(t) == 11 for t in et_types)
+
+
+def _has_tet4(gmsh) -> bool:
+    et_types, _, _ = gmsh.model.mesh.getElements(dim=3)
+    return any(int(t) == 4 for t in et_types)
 
 
 def _check_quality(gmsh, max_bad_ratio: float = 0.005) -> tuple[bool, int, int]:
@@ -357,6 +267,140 @@ def _try_repair_high_order(gmsh) -> None:
             pass
 
 
+# Gmsh tet10 node order (0-based): v0 v1 v2 v3  m01 m12 m20 m03 m23 m13
+# So midside-node position in the 10-node row -> (corner A, corner B) it connects
+_TET10_EDGE_MAP: tuple[tuple[int, int, int], ...] = (
+    (4, 0, 1),
+    (5, 1, 2),
+    (6, 2, 0),
+    (7, 0, 3),
+    (8, 2, 3),
+    (9, 1, 3),
+)
+
+
+def _flatten_bad_midside_nodes(
+    gmsh, threshold: float = 1e-6
+) -> tuple[int, list[tuple[float, float, float]]]:
+    """Find tet10 elements with minSJ <= threshold and relocate their midside
+    nodes to the midpoint of their edge endpoints.
+
+    A straight-edged tet10 has the same geometry as its linear tet4 skeleton, so
+    as long as the corner nodes form a valid tet the element is guaranteed
+    positive-Jacobian afterwards. Midside nodes are shared with neighbours; the
+    accuracy cost is that curved-edge approximation is locally lost.
+
+    Returns (n_repaired_elements, list_of_element_centroids).
+    """
+    try:
+        tags_all, coords_flat, _ = gmsh.model.mesh.getNodes()
+    except Exception:
+        return 0, []
+
+    coord_map: dict[int, np.ndarray] = {}
+    for i, t in enumerate(tags_all):
+        coord_map[int(t)] = np.asarray(
+            coords_flat[3 * i : 3 * i + 3], dtype=np.float64
+        )
+
+    et_types, et_tags, et_conn = gmsh.model.mesh.getElements(dim=3)
+
+    repaired_centroids: list[tuple[float, float, float]] = []
+    node_updates: dict[int, np.ndarray] = {}  # tag -> new xyz (dedup for shared edges)
+
+    for code, tags, conn in zip(et_types, et_tags, et_conn):
+        if int(code) != 11:
+            continue
+        tag_list = [int(t) for t in tags]
+        if not tag_list:
+            continue
+        conn_arr = np.asarray(conn, dtype=np.int64).reshape(-1, 10)
+        try:
+            qual = gmsh.model.mesh.getElementQualities(tag_list, "minSJ")
+        except Exception:
+            qual = [0.0] * len(tag_list)
+
+        for i, q in enumerate(qual):
+            if float(q) > threshold:
+                continue
+            nodes = [int(x) for x in conn_arr[i]]
+            pts = [coord_map.get(n) for n in nodes]
+            if any(p is None for p in pts):
+                continue
+            centroid = np.mean(np.stack(pts), axis=0)
+            repaired_centroids.append(
+                (float(centroid[0]), float(centroid[1]), float(centroid[2]))
+            )
+            for mid_idx, a_idx, b_idx in _TET10_EDGE_MAP:
+                mid_tag = nodes[mid_idx]
+                if mid_tag in node_updates:
+                    continue
+                a = coord_map[nodes[a_idx]]
+                b = coord_map[nodes[b_idx]]
+                node_updates[mid_tag] = 0.5 * (a + b)
+
+    # Push corrected positions back into gmsh
+    for tag, coord in node_updates.items():
+        try:
+            gmsh.model.mesh.setNode(int(tag), [float(coord[0]), float(coord[1]), float(coord[2])], [])
+        except Exception:
+            pass
+
+    return len(repaired_centroids), repaired_centroids
+
+
+def _collect_bad_element_centroids(
+    gmsh, threshold: float = 0.0
+) -> list[tuple[float, float, float]]:
+    """Return centroids of any remaining tet10 elements with minSJ <= threshold."""
+    try:
+        tags_all, coords_flat, _ = gmsh.model.mesh.getNodes()
+    except Exception:
+        return []
+    coord_map = {
+        int(t): np.asarray(coords_flat[3 * i : 3 * i + 3], dtype=np.float64)
+        for i, t in enumerate(tags_all)
+    }
+    et_types, et_tags, et_conn = gmsh.model.mesh.getElements(dim=3)
+    out: list[tuple[float, float, float]] = []
+    for code, tags, conn in zip(et_types, et_tags, et_conn):
+        if int(code) != 11:
+            continue
+        tag_list = [int(t) for t in tags]
+        if not tag_list:
+            continue
+        try:
+            qual = gmsh.model.mesh.getElementQualities(tag_list, "minSJ")
+        except Exception:
+            continue
+        conn_arr = np.asarray(conn, dtype=np.int64).reshape(-1, 10)
+        for i, q in enumerate(qual):
+            if float(q) > threshold:
+                continue
+            nodes = [int(x) for x in conn_arr[i]]
+            pts = [coord_map[n] for n in nodes if n in coord_map]
+            if not pts:
+                continue
+            c = np.mean(np.stack(pts), axis=0)
+            out.append((float(c[0]), float(c[1]), float(c[2])))
+    return out
+
+
+def _write_repair_csv(
+    path: Path,
+    repaired: list[tuple[float, float, float]],
+    dropped: list[tuple[float, float, float]],
+) -> None:
+    """Write per-element repair log: status,x,y,z."""
+    with open(path, "w", encoding="ascii") as f:
+        f.write("# mesh repair log (coords in mm)\n")
+        f.write("status,x,y,z\n")
+        for x, y, z in repaired:
+            f.write(f"repaired,{x:.6g},{y:.6g},{z:.6g}\n")
+        for x, y, z in dropped:
+            f.write(f"still_bad,{x:.6g},{y:.6g},{z:.6g}\n")
+
+
 # --------------------------------------------------------------------- mapping
 
 def _map_faces_to_gmsh(gmsh, geometry: GeometryPayload) -> dict[int, int]:
@@ -396,72 +440,6 @@ def _map_faces_to_gmsh(gmsh, geometry: GeometryPayload) -> dict[int, int]:
             mapping[fid] = best_tag
     return mapping
 
-
-def _defeature_small_faces(
-    gmsh,
-    geometry: GeometryPayload,
-    bcs: list[BC],
-    target: float,
-    factor: float,
-) -> int:
-    """Automatically remove surfaces smaller than (target * factor)^2.
-
-    Uses OCC's defeature() which suppresses the specified surfaces and fills
-    the resulting holes by extending neighbouring surfaces. Faster than
-    re-meshing from scratch because the overall parametric geometry is kept.
-
-    BC-tagged surfaces are protected: we compute protected centroids from
-    ``geometry.faces`` (the original OCP face_ids) and skip any gmsh surface
-    whose centroid is within one mesh element of a BC face centroid.
-    """
-    threshold_area = (target * factor) ** 2
-
-    # Protected centroids = OCP faces that have BC assignments
-    protected_face_ids: set[int] = set()
-    for bc in bcs:
-        for fid in bc.faceIds:
-            protected_face_ids.add(int(fid))
-    protected_centroids: list[np.ndarray] = []
-    for f in geometry.faces:
-        if f.face_id in protected_face_ids:
-            pts = np.asarray(f.positions, dtype=np.float64).reshape(-1, 3)
-            if pts.size > 0:
-                protected_centroids.append(pts.mean(axis=0))
-
-    surface_tags = [t for _d, t in gmsh.model.getEntities(2)]
-    to_remove: list[int] = []
-    for t in surface_tags:
-        try:
-            area = float(gmsh.model.occ.getMass(2, t))
-        except Exception:
-            continue
-        if area >= threshold_area:
-            continue
-        try:
-            cx, cy, cz = gmsh.model.occ.getCenterOfMass(2, t)
-        except Exception:
-            continue
-        c = np.array([cx, cy, cz], dtype=np.float64)
-        # Skip surfaces that are near a BC face centroid
-        is_protected = any(
-            float(np.linalg.norm(c - pc)) < target for pc in protected_centroids
-        )
-        if not is_protected:
-            to_remove.append(int(t))
-
-    if not to_remove:
-        return 0
-
-    volume_tags = [int(t) for _d, t in gmsh.model.getEntities(3)]
-    if not volume_tags:
-        return 0
-
-    try:
-        gmsh.model.occ.defeature(volume_tags, to_remove)
-        gmsh.model.occ.synchronize()
-        return len(to_remove)
-    except Exception:
-        return 0
 
 
 def _assign_bc_physical_groups(
@@ -544,9 +522,9 @@ def _write_inp(
     node_tags: np.ndarray,
     coords: np.ndarray,
     tet_conn: np.ndarray,
-    tag_to_idx: dict[int, int],
     bc_payloads: list[BCPayload],
     material: Material,
+    element_order: int = 2,
 ) -> None:
     lines: list[str] = []
     lines.append("*HEADING")
@@ -557,16 +535,23 @@ def _write_inp(
         x, y, z = coords[i]
         lines.append(f"{int(t)}, {x:.9g}, {y:.9g}, {z:.9g}")
 
-    lines.append("*ELEMENT, TYPE=C3D10, ELSET=SOLID")
-    # Gmsh tet10 order (0-based): v0 v1 v2 v3  m01 m12 m20 m03 m23 m13
-    # Abaqus C3D10  order (0-based): v0 v1 v2 v3  m01 m12 m20 m03 m13 m23
-    # -> swap last two columns
-    for e, row in enumerate(tet_conn, start=1):
-        reordered = [row[0], row[1], row[2], row[3],
-                     row[4], row[5], row[6], row[7],
-                     row[9], row[8]]
-        labels = [str(int(node_tags[idx])) for idx in reordered]
-        lines.append(", ".join([str(e)] + labels))
+    if element_order == 2:
+        lines.append("*ELEMENT, TYPE=C3D10, ELSET=SOLID")
+        # Gmsh tet10 order (0-based): v0 v1 v2 v3  m01 m12 m20 m03 m23 m13
+        # Abaqus C3D10  order (0-based): v0 v1 v2 v3  m01 m12 m20 m03 m13 m23
+        # -> swap last two columns
+        for e, row in enumerate(tet_conn, start=1):
+            reordered = [row[0], row[1], row[2], row[3],
+                         row[4], row[5], row[6], row[7],
+                         row[9], row[8]]
+            labels = [str(int(node_tags[idx])) for idx in reordered]
+            lines.append(", ".join([str(e)] + labels))
+    else:
+        # Linear tet4 fallback. Node order identical between gmsh and Abaqus.
+        lines.append("*ELEMENT, TYPE=C3D4, ELSET=SOLID")
+        for e, row in enumerate(tet_conn, start=1):
+            labels = [str(int(node_tags[idx])) for idx in row[:4]]
+            lines.append(", ".join([str(e)] + labels))
 
     for bp in bc_payloads:
         lines.append(f"*NSET, NSET=BC{bp.idx}")

@@ -25,7 +25,8 @@ export function Toolbar() {
   const running =
     !!job && !["done", "failed", "cancelled"].includes(job.status);
   const hasFix = bcs.some((b) => b.type === "fix");
-  const canRun = !!project && bcs.length > 0 && hasFix && !running;
+  const hasLoad = bcs.some((b) => b.type === "load");
+  const canRun = !!project && bcs.length > 0 && hasFix && hasLoad && !running;
 
   const onPick = () => inputRef.current?.click();
 
@@ -71,6 +72,8 @@ export function Toolbar() {
             ? "境界条件を追加してください"
             : !hasFix
             ? "少なくとも1つの拘束が必要です"
+            : !hasLoad
+            ? "少なくとも1つの荷重が必要です(無いと応力は常に0)"
             : ""
         }
       >
