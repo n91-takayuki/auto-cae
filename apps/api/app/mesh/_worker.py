@@ -19,7 +19,6 @@ import sys
 import traceback
 from pathlib import Path
 
-# Ensure we can import app.* when launched directly (not via -m)
 _HERE = Path(__file__).resolve()
 _APP_API_ROOT = _HERE.parents[2]   # .../apps/api
 if str(_APP_API_ROOT) not in sys.path:
@@ -30,6 +29,89 @@ import numpy as np  # noqa: E402
 from app.cad.step_loader import load_step  # noqa: E402
 from app.mesh import gmsh_runner as gr  # noqa: E402
 from app.schemas.jobs import FixBC, LoadBC, Material  # noqa: E402
+
+
+def _ocp_prerepair(step_path: Path, out_dir: Path) -> "Path | None":
+    """OCP ShapeFix + Sewing + MakeSolid to fix broken wire/face topology.
+
+    This targets the "Could not fix wire in surface N/M" class of failures
+    that gmsh healShapes cannot handle, since those are topological defects
+    rather than geometric gaps.
+    """
+    try:
+        from OCP.STEPControl import STEPControl_Reader, STEPControl_Writer, STEPControl_AsIs
+        from OCP.IFSelect import IFSelect_RetDone
+        from OCP.ShapeFix import ShapeFix_Shape
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+        from OCP.BRepLib import BRepLib
+        from OCP.TopAbs import TopAbs_SHELL
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+    except ImportError as e:
+        print(f"OCP prerepair: import error: {e}", file=sys.stderr)
+        return None
+
+    try:
+        reader = STEPControl_Reader()
+        if reader.ReadFile(str(step_path)) != IFSelect_RetDone:
+            return None
+        reader.TransferRoots()
+        shape = reader.OneShape()
+        if shape.IsNull():
+            return None
+    except Exception as e:
+        print(f"OCP prerepair: load failed: {e}", file=sys.stderr)
+        return None
+
+    try:
+        fixer = ShapeFix_Shape(shape)
+        fixer.Perform()
+        fixed = fixer.Shape()
+        if fixed.IsNull():
+            return None
+    except Exception as e:
+        print(f"OCP prerepair: ShapeFix failed: {e}", file=sys.stderr)
+        return None
+
+    try:
+        sewer = BRepBuilderAPI_Sewing(1e-2)
+        sewer.Add(fixed)
+        sewer.Perform()
+        sewn = sewer.SewedShape()
+        if sewn.IsNull():
+            return None
+    except Exception as e:
+        print(f"OCP prerepair: Sewing failed: {e}", file=sys.stderr)
+        return None
+
+    try:
+        maker = BRepBuilderAPI_MakeSolid()
+        exp = TopExp_Explorer(sewn, TopAbs_SHELL)
+        n_shells = 0
+        while exp.More():
+            maker.Add(TopoDS.Shell_s(exp.Current()))
+            n_shells += 1
+            exp.Next()
+        if n_shells == 0 or not maker.IsDone():
+            return None
+        solid = maker.Solid()
+        BRepLib.OrientClosedSolid_s(solid)
+    except Exception as e:
+        print(f"OCP prerepair: MakeSolid failed: {e}", file=sys.stderr)
+        return None
+
+    out_path = out_dir / "_god_prerepaired.stp"
+    try:
+        writer = STEPControl_Writer()
+        writer.Transfer(solid, STEPControl_AsIs)
+        if writer.Write(str(out_path)) != IFSelect_RetDone:
+            return None
+    except Exception as e:
+        print(f"OCP prerepair: write failed: {e}", file=sys.stderr)
+        return None
+
+    print(f"OCP prerepair: OK ({n_shells} shell(s)) → {out_path.name}", file=sys.stderr)
+    return out_path
 
 
 def _build_bc(d: dict):
@@ -75,12 +157,56 @@ def main() -> int:
     try:
         gr._setup_strategy(gmsh, strat, target)
         gmsh.model.add("job")
-        gmsh.model.occ.importShapes(str(step_path))
+
+        if strat.ignore_topology:
+            # God Mode: Stage 1 — OCP ShapeFix to fix broken wire/face topology
+            # (topological defects that gmsh healShapes cannot reach).
+            repaired = _ocp_prerepair(step_path, out_dir)
+            step_to_import = repaired if repaired is not None else step_path
+            if repaired is None:
+                print(f"[{strategy_name}] OCP prerepair skipped, using original STEP", file=sys.stderr)
+        else:
+            step_to_import = step_path
+
+        try:
+            gmsh.model.occ.importShapes(str(step_to_import))
+        except Exception as e:
+            print(f"[{strategy_name}] importShapes failed: {e}", file=sys.stderr)
+            return 1
         gmsh.model.occ.synchronize()
+
+        if strat.ignore_topology:
+            # God Mode: Stage 2 — gmsh healShapes with 2× tolerance to close
+            # residual micro-gaps and promote closed shells to solids.
+            heal_tol = target * 2.0
+            try:
+                all_ents = gmsh.model.getEntities()
+                gmsh.model.occ.healShapes(
+                    all_ents,
+                    tolerance=heal_tol,
+                    fixDegenerated=True,
+                    fixSmallEdges=True,
+                    fixSmallFaces=True,
+                    sewFaces=True,
+                    makeSolids=True,
+                )
+                gmsh.model.occ.synchronize()
+                n_vols = len(gmsh.model.getEntities(3))
+                print(
+                    f"[{strategy_name}] healShapes OK: {n_vols} vol(s) tol={heal_tol:.3g}mm",
+                    file=sys.stderr,
+                )
+                if n_vols == 0:
+                    print(f"[{strategy_name}] still no volumes after healShapes", file=sys.stderr)
+                    return 1
+            except Exception as e:
+                print(f"[{strategy_name}] healShapes failed: {e}", file=sys.stderr)
+                return 1
 
         face_id_to_tag = gr._map_faces_to_gmsh(gmsh, geometry)
         bc_tags = gr._assign_bc_physical_groups(gmsh, bcs, face_id_to_tag)
 
+        # ── mesh generation ──────────────────────────────────────────────────
         gmsh.model.mesh.generate(3)
         if strat.elevate:
             gmsh.model.mesh.setOrder(2)
@@ -109,7 +235,7 @@ def main() -> int:
                     )
                     return 1
 
-        # ---- extract mesh ----
+        # ── extract mesh ─────────────────────────────────────────────────────
         node_tags_raw, coords_flat, _ = gmsh.model.mesh.getNodes()
         node_tags = np.asarray(node_tags_raw, dtype=np.int64)
         coords = np.asarray(coords_flat, dtype=np.float64).reshape(-1, 3)
@@ -155,7 +281,7 @@ def main() -> int:
 
         bc_payloads = gr._collect_bc_payloads(gmsh, bcs, bc_tags, coords, tag_to_idx)
 
-        # ---- write artifacts ----
+        # ── write artifacts ──────────────────────────────────────────────────
         out_dir.mkdir(parents=True, exist_ok=True)
         inp_path = out_dir / "job.inp"
         gr._write_inp(

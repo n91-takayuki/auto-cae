@@ -27,6 +27,7 @@ ProgressFn = Callable[[float, str], None]
 
 _GMSH_LOCK = Lock()
 _WORKER_PATH = Path(__file__).parent / "_worker.py"
+_WORKER_TIMEOUT_S = 300.0
 
 
 @dataclass
@@ -39,34 +40,47 @@ class MeshResult:
     tet_conn: np.ndarray        # int64, shape (E, 10)
     surface_tris: np.ndarray    # int64, shape (T, 3)
     strategy_used: str = ""
-    repaired_count: int = 0
+    repaired_count: int = 0           # elements whose midside nodes were flattened
     repaired_centroids: list[tuple[float, float, float]] | None = None
-    dropped_count: int = 0
+    dropped_count: int = 0            # elements still bad after repair (reported only)
     dropped_centroids: list[tuple[float, float, float]] | None = None
     repair_csv_path: Path | None = None
 
 
+# Meshing strategies tried in order. Speed-first to robust-last.
 @dataclass(frozen=True)
 class _Strategy:
     name: str
-    algo2d: int           # Mesh.Algorithm   (6=Frontal-Delaunay, 1=MeshAdapt)
-    algo3d: int           # Mesh.Algorithm3D (10=HXT, 4=Frontal, 1=Delaunay)
-    order_at_gen: int     # 2=generate tet10 directly, 1=generate tet4
-    elevate: bool         # True -> setOrder(2) after generate to get tet10
-    timeout_s: float      # per-strategy subprocess timeout in seconds
-    coarse_factor: float = 1.0     # target mesh size multiplier
-    ignore_topology: bool = False  # God Mode: extreme tolerances, ignore small features
+    algo2d: int         # Mesh.Algorithm   (6=Frontal-Delaunay, 5=Delaunay, 1=MeshAdapt)
+    algo3d: int         # Mesh.Algorithm3D (10=HXT, 1=Delaunay, 4=Frontal)
+    order_at_gen: int   # 2=generate tet10 directly, 1=generate tet4 first
+    elevate: bool       # after generate: True -> setOrder(2) to get tet10, False -> keep tet4
+    local_defeaturing: bool = False # If True, dynamically ignore small faces via mesh sizing
+    heal_occ: bool = False          # If True, enable heavy OCC auto-healing (sewing, fixing edges)
+    coarse_factor: float = 1.0      # Multiplier for target mesh size to swallow CAD flaws
+    ignore_topology: bool = False   # NEW: If True, completely ignore CAD points/curves and force coarse mesh
 
 
 _STRATEGIES: list[_Strategy] = [
-    # 1. Fast path — clean CAD finishes in seconds; broken topology fails fast
-    _Strategy("Fast tet10 (HXT)",          algo2d=6, algo3d=10, order_at_gen=2, elevate=True,  timeout_s=30.0),
-    # 2. Robust 1st-order — drop curved elements, Frontal tet4 is more tolerant
-    _Strategy("Robust tet4 (Frontal)",     algo2d=6, algo3d=4,  order_at_gen=1, elevate=False, timeout_s=45.0),
-    # 3. Coarse 2× — force larger mesh size; MeshAdapt swallows micro-gaps
-    _Strategy("Coarse tet4 (MeshAdapt 2x)",algo2d=1, algo3d=1,  order_at_gen=1, elevate=False, timeout_s=45.0, coarse_factor=2.0),
-    # 4. God Mode — topology broken beyond repair; extreme tolerance + 10× coarse
-    _Strategy("God Mode tet4",             algo2d=1, algo3d=1,  order_at_gen=1, elevate=False, timeout_s=60.0, coarse_factor=10.0, ignore_topology=True),
+    # 1. Fast path: direct tet10 with aggressive HO-optimization (HXT 3D).
+    _Strategy("fast tet10 (HXT)",            6, 10, 2, True),
+    # 2. Robust path: linear first, then elevate (HXT). Usually passes where (1) fails.
+    _Strategy("robust tet10 (HXT lin+elev)", 6, 10, 1, True),
+    # 3. Frontal 3D — different boundary recovery.
+    _Strategy("Frontal tet10 (lin+elev)",    6,  4, 1, True),
+    # 4. Pure tet4 with Frontal. No curvature, lenient boundary recovery.
+    _Strategy("Frontal tet4 (C3D4)",         6,  4, 1, False),
+    # 5. Local defeaturing. Finds sliver faces/edges and forces large mesh sizes locally.
+    _Strategy("Defeatured tet4 (local size)",6,  4, 1, False, True, False),
+    # 6. OCC Auto Healing. Sews broken topology but maintains original target size.
+    _Strategy("Healed tet4 (OCC AutoFix)",   6,  4, 1, False, False, True),
+    # 7. Shift algorithms to robust MeshAdapt/Delaunay and DOUBLE the global mesh size.
+    _Strategy("Coarse Delaunay tet4",        1,  1, 1, False, False, True, 2.0),
+    # 8. QUADRUPLE the mesh size. Swallows almost any CAD errors.
+    _Strategy("Extreme Coarse tet4",         1,  1, 1, False, False, True, 4.0),
+    # 9. NEW: God Mode. Ignores CAD points/curves, forces extreme tolerance, and multiplies size by 10.
+    #    This strips away the original shape's details to guarantee a mesh is produced.
+    _Strategy("God Mode tet4 (Ignore Topology)", 1,  1, 1, False, False, True, 10.0, True),
 ]
 
 
@@ -115,13 +129,13 @@ def mesh_and_write_inp(
                 proc = subprocess.run(
                     [sys.executable, str(_WORKER_PATH), str(input_json)],
                     capture_output=True,
-                    timeout=strat.timeout_s,
+                    timeout=_WORKER_TIMEOUT_S,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                 )
             except subprocess.TimeoutExpired:
-                last_err = f"[{strat.name}] timed out after {strat.timeout_s:.0f}s"
+                last_err = f"[{strat.name}] timed out after {_WORKER_TIMEOUT_S:.0f}s"
                 continue
 
             if proc.returncode == 0:
@@ -130,17 +144,21 @@ def mesh_and_write_inp(
 
             err_lines = (proc.stderr or "").strip().splitlines()
             last_err = err_lines[-1] if err_lines else f"[{strat.name}] exit {proc.returncode}"
+            continue
 
     raise RuntimeError(
         f"All {len(_STRATEGIES)} meshing strategies failed. "
         f"Last error: {last_err}. "
-        f"The CAD model topology is severely broken. "
-        f"Workaround: simplify the model in FreeCAD/Fusion 360 by suppressing threads, "
-        f"fillets, and small holes before re-exporting as STEP."
+        f"Likely causes: (1) threading or spiral features that gmsh cannot "
+        f"surface-mesh cleanly, (2) STEP topology gaps. "
+        f"Workarounds: simplify the CAD in FreeCAD/"
+        f"Fusion 360 by suppressing threads/fillets; or export the model as "
+        f"a single body without threads."
     )
 
 
 def _load_worker_outputs(out_dir: Path, strat: "_Strategy") -> MeshResult:
+    """Load the artifacts written by a successful subprocess worker run."""
     result_path = out_dir / "result.json"
     npz_path = out_dir / "mesh.npz"
     if not result_path.exists() or not npz_path.exists():
@@ -165,6 +183,36 @@ def _load_worker_outputs(out_dir: Path, strat: "_Strategy") -> MeshResult:
     )
 
 
+def _apply_local_defeaturing(gmsh, target: float) -> None:
+    """Find small faces/edges and force a large mesh size so the mesher ignores them."""
+    threshold = target * 0.1  # Consider entities smaller than 10% of target size as flaws
+    dim_tags_to_resize = []
+
+    for dim, tag in gmsh.model.getEntities(1):
+        try:
+            xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(dim, tag)
+            length_approx = ((xmax - xmin)**2 + (ymax - ymin)**2 + (zmax - zmin)**2)**0.5
+            if 0 < length_approx < threshold:
+                dim_tags_to_resize.append((dim, tag))
+        except Exception:
+            pass
+
+    for dim, tag in gmsh.model.getEntities(2):
+        try:
+            xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(dim, tag)
+            diag_approx = ((xmax - xmin)**2 + (ymax - ymin)**2 + (zmax - zmin)**2)**0.5
+            if 0 < diag_approx < threshold:
+                dim_tags_to_resize.append((dim, tag))
+        except Exception:
+            pass
+
+    if dim_tags_to_resize:
+        try:
+            gmsh.model.mesh.setSize(dim_tags_to_resize, target * 1.5)
+        except Exception:
+            pass
+
+
 def _setup_strategy(gmsh, strat: _Strategy, target: float) -> None:
     """Reset gmsh state and configure options for this strategy attempt."""
     try:
@@ -173,40 +221,52 @@ def _setup_strategy(gmsh, strat: _Strategy, target: float) -> None:
         pass
     gmsh.option.setNumber("General.Terminal", 0)
 
-    current_target = target * strat.coarse_factor
+    # Calculate actual target size incorporating the coarse factor
+    current_target = target * getattr(strat, "coarse_factor", 1.0)
 
-    if strat.ignore_topology:
-        # God Mode: enable all OCC healing, use extreme tolerances.
-        # Use half the base mesh size (not coarsened) — large enough to close
-        # typical STEP gaps (broken wires, seam edges, micro-gaps) without
-        # merging surfaces that are genuinely separate.
-        tol = target * 0.5
-        gmsh.option.setNumber("Geometry.Tolerance", tol)
+    if getattr(strat, "ignore_topology", False):
+        # NEW: God Mode settings. Disconnect mesh size from geometry details.
+        # This prevents the mesher from trying to capture small CAD features.
+        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+        # Use a massive tolerance to force OpenCASCADE to fuse tiny gaps/faces together
+        gmsh.option.setNumber("Geometry.Tolerance", current_target * 0.5)
         gmsh.option.setNumber("Geometry.OCCAutoFix", 1)
         gmsh.option.setNumber("Geometry.OCCFixDegenerated", 1)
         gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 1)
         gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 1)
         gmsh.option.setNumber("Geometry.OCCSewFaces", 1)
-        # Force uniform coarse mesh — ignores all small feature constraints
-        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
-        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", current_target)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", current_target)
+    elif getattr(strat, "heal_occ", False):
+        # Normal heavy OCC healing
+        gmsh.option.setNumber("Geometry.Tolerance", max(1e-4, current_target * 0.01))
+        gmsh.option.setNumber("Geometry.OCCAutoFix", 1)
+        gmsh.option.setNumber("Geometry.OCCFixDegenerated", 1)
+        gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 1)
+        gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 1)
+        gmsh.option.setNumber("Geometry.OCCSewFaces", 1)
     else:
-        # Standard: disable OCC healing so fast strategies fail fast on broken topology
         gmsh.option.setNumber("Geometry.OCCAutoFix", 0)
         gmsh.option.setNumber("Geometry.OCCFixDegenerated", 0)
         gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 0)
         gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 0)
         gmsh.option.setNumber("Geometry.OCCSewFaces", 0)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", current_target * 0.25)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", current_target)
 
+    # Mesh size configuration
+    if getattr(strat, "ignore_topology", False):
+        # In God Mode, force uniform large elements everywhere
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", current_target)
+    else:
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", current_target * 0.25)
+        
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", current_target)
     gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+
+    # Algorithm choices for this attempt
     gmsh.option.setNumber("Mesh.ElementOrder", strat.order_at_gen)
     gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
     gmsh.option.setNumber("Mesh.Algorithm", strat.algo2d)
     gmsh.option.setNumber("Mesh.Algorithm3D", strat.algo3d)
+    
     gmsh.option.setNumber("Mesh.Optimize", 1)
     gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
     gmsh.option.setNumber("Mesh.OptimizeThreshold", 0.3)
@@ -214,6 +274,9 @@ def _setup_strategy(gmsh, strat: _Strategy, target: float) -> None:
     gmsh.option.setNumber("Mesh.HighOrderPassMax", 25)
     gmsh.option.setNumber("Mesh.HighOrderThresholdMin", 0.1)
     gmsh.option.setNumber("Mesh.HighOrderThresholdMax", 2.0)
+
+    if getattr(strat, "local_defeaturing", False):
+        _apply_local_defeaturing(gmsh, current_target)
 
 
 def _has_tet10(gmsh) -> bool:
@@ -258,8 +321,12 @@ def _try_repair_high_order(gmsh) -> None:
 
 
 _TET10_EDGE_MAP: tuple[tuple[int, int, int], ...] = (
-    (4, 0, 1), (5, 1, 2), (6, 2, 0),
-    (7, 0, 3), (8, 2, 3), (9, 1, 3),
+    (4, 0, 1),
+    (5, 1, 2),
+    (6, 2, 0),
+    (7, 0, 3),
+    (8, 2, 3),
+    (9, 1, 3),
 )
 
 
@@ -271,12 +338,14 @@ def _flatten_bad_midside_nodes(
     except Exception:
         return 0, []
 
-    coord_map: dict[int, np.ndarray] = {
-        int(t): np.asarray(coords_flat[3 * i : 3 * i + 3], dtype=np.float64)
-        for i, t in enumerate(tags_all)
-    }
+    coord_map: dict[int, np.ndarray] = {}
+    for i, t in enumerate(tags_all):
+        coord_map[int(t)] = np.asarray(
+            coords_flat[3 * i : 3 * i + 3], dtype=np.float64
+        )
 
     et_types, et_tags, et_conn = gmsh.model.mesh.getElements(dim=3)
+
     repaired_centroids: list[tuple[float, float, float]] = []
     node_updates: dict[int, np.ndarray] = {}
 
@@ -307,7 +376,9 @@ def _flatten_bad_midside_nodes(
                 mid_tag = nodes[mid_idx]
                 if mid_tag in node_updates:
                     continue
-                node_updates[mid_tag] = 0.5 * (coord_map[nodes[a_idx]] + coord_map[nodes[b_idx]])
+                a = coord_map[nodes[a_idx]]
+                b = coord_map[nodes[b_idx]]
+                node_updates[mid_tag] = 0.5 * (a + b)
 
     for tag, coord in node_updates.items():
         try:
@@ -463,9 +534,8 @@ def _collect_bc_payloads(
                             ic = tag_to_idx[int(row[2])]
                             pa, pb, pc = coords[ia], coords[ib], coords[ic]
                             cross = np.cross(pb - pa, pc - pa)
-                            dA = 0.5 * float(np.linalg.norm(cross))
-                            area += dA
-                            if dA > 0:
+                            area += 0.5 * float(np.linalg.norm(cross))
+                            if 0.5 * float(np.linalg.norm(cross)) > 0:
                                 normal += 0.5 * cross
             n_len = float(np.linalg.norm(normal))
             if n_len > 1e-18:
@@ -485,7 +555,11 @@ def _write_inp(
     material: Material,
     element_order: int = 2,
 ) -> None:
-    lines: list[str] = ["*HEADING", "auto_cae job", "*NODE"]
+    lines: list[str] = []
+    lines.append("*HEADING")
+    lines.append("auto_cae job")
+
+    lines.append("*NODE")
     for i, t in enumerate(node_tags):
         x, y, z = coords[i]
         lines.append(f"{int(t)}, {x:.9g}, {y:.9g}, {z:.9g}")
@@ -508,16 +582,15 @@ def _write_inp(
         lines.append(f"*NSET, NSET=BC{bp.idx}")
         _emit_list(lines, [int(x) for x in bp.node_tags.tolist()])
 
-    lines.extend([
-        "*MATERIAL, NAME=MAT1",
-        "*ELASTIC",
-        f"{material.young:.6g}, {material.poisson:.4g}",
-        "*DENSITY",
-        f"{material.density:.6g}",
-        "*SOLID SECTION, ELSET=SOLID, MATERIAL=MAT1",
-        "*STEP",
-        "*STATIC",
-    ])
+    lines.append("*MATERIAL, NAME=MAT1")
+    lines.append("*ELASTIC")
+    lines.append(f"{material.young:.6g}, {material.poisson:.4g}")
+    lines.append("*DENSITY")
+    lines.append(f"{material.density:.6g}")
+    lines.append("*SOLID SECTION, ELSET=SOLID, MATERIAL=MAT1")
+
+    lines.append("*STEP")
+    lines.append("*STATIC")
 
     for bp in bc_payloads:
         if isinstance(bp.bc, FixBC):
@@ -538,11 +611,10 @@ def _write_inp(
         if n_nodes == 0:
             continue
 
-        total_mag = (
-            float(load.magnitude)
-            if load.kind == "force"
-            else float(load.magnitude) * float(bp.area)
-        )
+        if load.kind == "force":
+            total_mag = float(load.magnitude)
+        else:
+            total_mag = float(load.magnitude) * float(bp.area)
 
         if load.direction == "normal":
             direction = -bp.normal if np.linalg.norm(bp.normal) > 0 else np.zeros(3)
@@ -558,6 +630,7 @@ def _write_inp(
             continue
 
         fx, fy, fz = (direction * total_mag / n_nodes).tolist()
+
         lines.append("*CLOAD")
         for t in bp.node_tags.tolist():
             if abs(fx) > 0:
@@ -567,7 +640,12 @@ def _write_inp(
             if abs(fz) > 0:
                 lines.append(f"{int(t)}, 3, {fz:.9g}")
 
-    lines.extend(["*NODE FILE", "U", "*EL FILE", "S", "*END STEP"])
+    lines.append("*NODE FILE")
+    lines.append("U")
+    lines.append("*EL FILE")
+    lines.append("S")
+    lines.append("*END STEP")
+
     inp_path.write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
